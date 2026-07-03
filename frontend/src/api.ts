@@ -36,9 +36,22 @@ export type SavedView = {
   filters: ViewFilters;
   created_at: string;
   updated_at: string;
+  match_count?: number | null;
 };
 
-export type SavedViewPayload = Omit<SavedView, "id" | "created_at" | "updated_at">;
+export type SavedViewPayload = Omit<SavedView, "id" | "created_at" | "updated_at" | "match_count">;
+
+export type OptionItem = {
+  id: string;
+  name: string;
+  color?: string | null;
+  asset_count?: number | null;
+  hidden?: boolean | null;
+};
+
+export type OptionsResponse = {
+  items: OptionItem[];
+};
 
 export type MountSettings = {
   albums_enabled: boolean;
@@ -138,6 +151,13 @@ export const api = {
       body: JSON.stringify(view)
     }),
   deleteView: (id: string) => request<void>(`/api/admin/views/${id}`, { method: "DELETE" }),
+  matchCount: (filters: ViewFilters) =>
+    request<{ count: number | null }>("/api/admin/views/match-count", {
+      method: "POST",
+      body: JSON.stringify({ filters })
+    }),
+  tagOptions: () => request<OptionsResponse>("/api/admin/options/tags"),
+  peopleOptions: () => request<OptionsResponse>("/api/admin/options/people"),
   mount: () => request<MountSettings>("/api/admin/mount"),
   updateMount: (mount: MountSettings) =>
     request<MountSettings>("/api/admin/mount", {

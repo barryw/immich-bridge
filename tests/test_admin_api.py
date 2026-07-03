@@ -90,19 +90,82 @@ def test_admin_views_crud_and_diagnostics(tmp_path: Path) -> None:
     client = make_client(tmp_path)
     login(client)
 
+    with patch("immich_bridge.api.admin._count_matching_assets", return_value=12):
+        create_response = client.post(
+            "/api/admin/views",
+            json={
+                "name": "Kids",
+                "description": "",
+                "enabled": True,
+                "layout": "date_buckets",
+                "filters": {
+                    "album_ids": [],
+                    "person_ids": ["person-1"],
+                    "tag_ids": ["tag-1"],
+                    "is_favorite": True,
+                    "media_type": "IMAGE",
+                    "taken_after": None,
+                    "taken_before": None,
+                    "rating": None,
+                    "original_file_name": None,
+                    "ocr": None,
+                    "city": None,
+                    "country": None,
+                },
+            },
+        )
+
+    assert create_response.status_code == 201
+    view_id = create_response.json()["id"]
+    assert create_response.json()["match_count"] == 12
+
+    with patch("immich_bridge.api.admin._count_matching_assets", return_value=12):
+        list_response = client.get("/api/admin/views")
+    assert list_response.status_code == 200
+    assert list_response.json()["views"][0]["name"] == "Kids"
+    assert list_response.json()["views"][0]["match_count"] == 12
+
+    with patch("immich_bridge.api.admin._count_matching_assets", return_value=4):
+        update_response = client.put(
+            f"/api/admin/views/{view_id}",
+            json={
+                **create_response.json(),
+                "name": "Kids Favorites",
+                "layout": "flat",
+            },
+        )
+    assert update_response.status_code == 200
+    assert update_response.json()["layout"] == "flat"
+    assert update_response.json()["match_count"] == 4
+
+    diagnostics = client.get("/api/admin/diagnostics")
+    assert diagnostics.status_code == 200
+    assert diagnostics.json()["view_count"] == 1
+
+    delete_response = client.delete(f"/api/admin/views/{view_id}")
+    assert delete_response.status_code == 204
+    with patch("immich_bridge.api.admin._count_matching_assets", return_value=0):
+        assert client.get("/api/admin/views").json()["views"] == []
+
+
+def test_admin_views_remain_editable_without_cached_api_key(tmp_path: Path) -> None:
+    """Saved views should not require the in-memory API key cache for CRUD."""
+    client = make_client(tmp_path)
+    login(client)
+
     create_response = client.post(
         "/api/admin/views",
         json={
-            "name": "Kids",
+            "name": "Trips",
             "description": "",
             "enabled": True,
-            "layout": "date_buckets",
+            "layout": "flat",
             "filters": {
                 "album_ids": [],
-                "person_ids": ["person-1"],
-                "tag_ids": ["tag-1"],
-                "is_favorite": True,
-                "media_type": "IMAGE",
+                "person_ids": [],
+                "tag_ids": [],
+                "is_favorite": None,
+                "media_type": None,
                 "taken_after": None,
                 "taken_before": None,
                 "rating": None,
@@ -113,32 +176,24 @@ def test_admin_views_crud_and_diagnostics(tmp_path: Path) -> None:
             },
         },
     )
-
     assert create_response.status_code == 201
     view_id = create_response.json()["id"]
 
-    list_response = client.get("/api/admin/views")
+    with (
+        patch("immich_bridge.api.admin._get_admin_api_key", return_value=None),
+        patch("immich_bridge.api.admin._count_matching_assets") as count_assets,
+    ):
+        list_response = client.get("/api/admin/views")
+        update_response = client.put(
+            f"/api/admin/views/{view_id}",
+            json={**create_response.json(), "description": "Vacation folders"},
+        )
+
     assert list_response.status_code == 200
-    assert list_response.json()["views"][0]["name"] == "Kids"
-
-    update_response = client.put(
-        f"/api/admin/views/{view_id}",
-        json={
-            **create_response.json(),
-            "name": "Kids Favorites",
-            "layout": "flat",
-        },
-    )
+    assert list_response.json()["views"][0]["match_count"] is None
     assert update_response.status_code == 200
-    assert update_response.json()["layout"] == "flat"
-
-    diagnostics = client.get("/api/admin/diagnostics")
-    assert diagnostics.status_code == 200
-    assert diagnostics.json()["view_count"] == 1
-
-    delete_response = client.delete(f"/api/admin/views/{view_id}")
-    assert delete_response.status_code == 204
-    assert client.get("/api/admin/views").json()["views"] == []
+    assert update_response.json()["match_count"] is None
+    count_assets.assert_not_called()
 
 
 def test_admin_mount_and_write_policy_updates(tmp_path: Path) -> None:
@@ -163,3 +218,48 @@ def test_admin_mount_and_write_policy_updates(tmp_path: Path) -> None:
     policy["permanent_delete"] = True
     rejected = client.put("/api/admin/write-policy", json=policy)
     assert rejected.status_code == 400
+
+
+def test_admin_options_and_match_count_use_immich_api(tmp_path: Path) -> None:
+    """Admin API should expose Immich tags, people, and saved-view counts."""
+    client = make_client(tmp_path)
+    login(client)
+
+    with patch("immich_bridge.api.admin.ImmichClient") as fake_client:
+        instance = fake_client.return_value
+        instance.list_tags.return_value = [
+            {"id": "tag-1", "name": "Family", "color": "#00aa99", "assetCount": 5}
+        ]
+        instance.list_people.return_value = [{"id": "person-1", "name": "Alice", "assetCount": 7}]
+        instance.search_assets.return_value.total = 11
+        instance.search_assets.return_value.items = []
+
+        tags = client.get("/api/admin/options/tags")
+        people = client.get("/api/admin/options/people")
+        count = client.post(
+            "/api/admin/views/match-count",
+            json={
+                "filters": {
+                    "album_ids": [],
+                    "person_ids": ["person-1"],
+                    "tag_ids": ["tag-1"],
+                    "is_favorite": None,
+                    "media_type": None,
+                    "taken_after": None,
+                    "taken_before": None,
+                    "rating": None,
+                    "original_file_name": None,
+                    "ocr": None,
+                    "city": None,
+                    "country": None,
+                }
+            },
+        )
+
+    assert tags.status_code == 200
+    assert tags.json()["items"][0]["name"] == "Family"
+    assert people.status_code == 200
+    assert people.json()["items"][0]["name"] == "Alice"
+    assert count.status_code == 200
+    assert count.json()["count"] == 11
+    instance.search_assets.assert_called_once()

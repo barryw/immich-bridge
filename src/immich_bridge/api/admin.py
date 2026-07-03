@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import secrets
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from threading import Lock
 from typing import Annotated, Any, Literal
 from uuid import uuid4
 
@@ -18,11 +20,22 @@ from immich_bridge.admin_store import AdminStore, get_admin_store
 from immich_bridge.config import Settings, get_settings
 from immich_bridge.fs_model import safe_segment
 from immich_bridge.immich_auth import ImmichIdentity, validate_immich_api_key
+from immich_bridge.immich_client import ImmichApiError, ImmichClient
 from immich_bridge.logging import get_logger
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 SESSION_COOKIE = "immich_bridge_admin"
+_admin_api_keys: dict[str, tuple[str, datetime]] = {}
+_admin_api_keys_lock = Lock()
+
+
+@dataclass(frozen=True)
+class AdminContext:
+    """Authenticated admin context with a live Immich API key."""
+
+    session: dict[str, Any]
+    api_key: str
 
 
 class AdminLoginRequest(BaseModel):
@@ -96,12 +109,41 @@ class ViewResponse(ViewPayload):
     id: str
     created_at: str
     updated_at: str
+    match_count: int | None = None
 
 
 class ViewsResponse(BaseModel):
     """Saved views list response."""
 
     views: list[ViewResponse]
+
+
+class MatchCountRequest(BaseModel):
+    """Saved view count preview request."""
+
+    filters: ViewFilters
+
+
+class MatchCountResponse(BaseModel):
+    """Saved view count preview response."""
+
+    count: int | None
+
+
+class OptionItem(BaseModel):
+    """Selectable Immich metadata option."""
+
+    id: str
+    name: str
+    color: str | None = None
+    asset_count: int | None = None
+    hidden: bool | None = None
+
+
+class OptionsResponse(BaseModel):
+    """Selectable options response."""
+
+    items: list[OptionItem]
 
 
 class MountSettings(BaseModel):
@@ -146,6 +188,28 @@ class DiagnosticsResponse(BaseModel):
 
 def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _remember_admin_api_key(token_hash: str, api_key: str, expires_at: datetime) -> None:
+    with _admin_api_keys_lock:
+        _admin_api_keys[token_hash] = (api_key, expires_at)
+
+
+def _forget_admin_api_key(token_hash: str) -> None:
+    with _admin_api_keys_lock:
+        _admin_api_keys.pop(token_hash, None)
+
+
+def _get_admin_api_key(token_hash: str) -> str | None:
+    with _admin_api_keys_lock:
+        entry = _admin_api_keys.get(token_hash)
+        if entry is None:
+            return None
+        api_key, expires_at = entry
+        if expires_at <= datetime.now(UTC):
+            _admin_api_keys.pop(token_hash, None)
+            return None
+        return api_key
 
 
 def _identity_to_user(identity: ImmichIdentity) -> AdminUser:
@@ -199,7 +263,33 @@ def require_admin_session(
     session = store.get_session(_token_hash(token))
     if session is None:
         raise HTTPException(status_code=401, detail="Admin session expired")
+    session["_token_hash"] = _token_hash(token)
     return session
+
+
+def require_admin_context(
+    session: Annotated[dict[str, Any], Depends(require_admin_session)],
+) -> AdminContext:
+    """Require an active admin session with a live Immich API key."""
+    context = _optional_admin_context(session)
+    if context is None:
+        raise HTTPException(status_code=401, detail="Admin session requires re-login")
+    return context
+
+
+def optional_admin_context(
+    session: Annotated[dict[str, Any], Depends(require_admin_session)],
+) -> AdminContext | None:
+    """Return live admin context when the API key is still available."""
+    return _optional_admin_context(session)
+
+
+def _optional_admin_context(session: dict[str, Any]) -> AdminContext | None:
+    token_hash = str(session["_token_hash"])
+    api_key = _get_admin_api_key(token_hash)
+    if api_key is None:
+        return None
+    return AdminContext(session=session, api_key=api_key)
 
 
 @router.post("/session", response_model=AdminSessionResponse)
@@ -225,9 +315,10 @@ async def create_session(
     now = datetime.now(UTC)
     expires_at = now + timedelta(seconds=settings.admin_session_ttl_seconds)
     store.prune_sessions()
+    token_hash = _token_hash(token)
     store.create_session(
         {
-            "token_hash": _token_hash(token),
+            "token_hash": token_hash,
             "user_id": identity.user_id,
             "email": identity.email,
             "name": identity.name,
@@ -237,6 +328,7 @@ async def create_session(
             "last_seen_at": now.isoformat(),
         }
     )
+    _remember_admin_api_key(token_hash, payload.api_key, expires_at)
     response.set_cookie(
         SESSION_COOKIE,
         token,
@@ -274,30 +366,50 @@ async def delete_session(
     """Delete the current admin session."""
     token = _extract_bearer(authorization) or session_cookie
     if token:
-        store.delete_session(_token_hash(token))
+        token_hash = _token_hash(token)
+        store.delete_session(token_hash)
+        _forget_admin_api_key(token_hash)
     response.delete_cookie(SESSION_COOKIE, path="/")
     logger.info("admin_logout", user_id=session["user_id"])
 
 
 @router.get("/views", response_model=ViewsResponse)
 async def list_views(
+    settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[AdminStore, Depends(_store)],
-    _session: Annotated[dict[str, Any], Depends(require_admin_session)],
+    admin: Annotated[AdminContext | None, Depends(optional_admin_context)],
 ) -> ViewsResponse:
     """List saved DAV views."""
-    return ViewsResponse(views=[_view_response(view) for view in store.list_views()])
+    return ViewsResponse(
+        views=[
+            _view_response(
+                view,
+                match_count=_optional_count_matching_assets(
+                    settings,
+                    admin,
+                    view.get("filters") or {},
+                ),
+            )
+            for view in store.list_views()
+        ]
+    )
 
 
 @router.post("/views", response_model=ViewResponse, status_code=201)
 async def create_view(
     payload: ViewPayload,
+    settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[AdminStore, Depends(_store)],
-    _session: Annotated[dict[str, Any], Depends(require_admin_session)],
+    admin: Annotated[AdminContext | None, Depends(optional_admin_context)],
 ) -> ViewResponse:
     """Create a saved DAV view."""
     view = payload.model_dump()
     view["id"] = str(uuid4())
-    return _view_response(store.upsert_view(view))
+    stored = store.upsert_view(view)
+    return _view_response(
+        stored,
+        match_count=_optional_count_matching_assets(settings, admin, stored.get("filters") or {}),
+    )
 
 
 @router.get("/views/{view_id}", response_model=ViewResponse)
@@ -317,15 +429,20 @@ async def get_view(
 async def update_view(
     view_id: str,
     payload: ViewPayload,
+    settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[AdminStore, Depends(_store)],
-    _session: Annotated[dict[str, Any], Depends(require_admin_session)],
+    admin: Annotated[AdminContext | None, Depends(optional_admin_context)],
 ) -> ViewResponse:
     """Update a saved DAV view."""
     if store.get_view(view_id) is None:
         raise HTTPException(status_code=404, detail="View not found")
     view = payload.model_dump()
     view["id"] = view_id
-    return _view_response(store.upsert_view(view))
+    stored = store.upsert_view(view)
+    return _view_response(
+        stored,
+        match_count=_optional_count_matching_assets(settings, admin, stored.get("filters") or {}),
+    )
 
 
 @router.delete("/views/{view_id}", status_code=204)
@@ -337,6 +454,44 @@ async def delete_view(
     """Delete a saved DAV view."""
     if not store.delete_view(view_id):
         raise HTTPException(status_code=404, detail="View not found")
+
+
+@router.post("/views/match-count", response_model=MatchCountResponse)
+async def match_count(
+    payload: MatchCountRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+    admin: Annotated[AdminContext, Depends(require_admin_context)],
+) -> MatchCountResponse:
+    """Return the number of Immich assets matching a saved-view filter."""
+    return MatchCountResponse(
+        count=_count_matching_assets(settings, admin, payload.filters.model_dump())
+    )
+
+
+@router.get("/options/tags", response_model=OptionsResponse)
+async def list_tag_options(
+    settings: Annotated[Settings, Depends(get_settings)],
+    admin: Annotated[AdminContext, Depends(require_admin_context)],
+) -> OptionsResponse:
+    """Return Immich tags for view configuration."""
+    client = _admin_immich_client(settings, admin)
+    try:
+        return OptionsResponse(items=[_tag_option(tag) for tag in client.list_tags()])
+    finally:
+        client.close()
+
+
+@router.get("/options/people", response_model=OptionsResponse)
+async def list_people_options(
+    settings: Annotated[Settings, Depends(get_settings)],
+    admin: Annotated[AdminContext, Depends(require_admin_context)],
+) -> OptionsResponse:
+    """Return Immich people for view configuration."""
+    client = _admin_immich_client(settings, admin)
+    try:
+        return OptionsResponse(items=[_person_option(person) for person in client.list_people()])
+    finally:
+        client.close()
 
 
 @router.get("/mount", response_model=MountSettings)
@@ -416,7 +571,7 @@ async def events(
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
-def _view_response(view: dict[str, Any]) -> ViewResponse:
+def _view_response(view: dict[str, Any], *, match_count: int | None = None) -> ViewResponse:
     return ViewResponse(
         id=str(view["id"]),
         name=str(view["name"]),
@@ -426,7 +581,96 @@ def _view_response(view: dict[str, Any]) -> ViewResponse:
         filters=ViewFilters.model_validate(view.get("filters") or {}),
         created_at=str(view.get("createdAt") or ""),
         updated_at=str(view.get("updatedAt") or ""),
+        match_count=match_count,
     )
+
+
+def _admin_immich_client(settings: Settings, admin: AdminContext) -> ImmichClient:
+    return ImmichClient(
+        base_url=settings.immich_url,
+        api_key=admin.api_key,
+        user_scope=str(admin.session["user_id"]),
+        timeout_seconds=settings.immich_timeout_seconds,
+        search_cache_ttl_seconds=settings.search_cache_ttl_seconds,
+    )
+
+
+def _optional_count_matching_assets(
+    settings: Settings,
+    admin: AdminContext | None,
+    filters: dict[str, Any],
+) -> int | None:
+    if admin is None:
+        return None
+    return _count_matching_assets(settings, admin, filters)
+
+
+def _count_matching_assets(
+    settings: Settings,
+    admin: AdminContext,
+    filters: dict[str, Any],
+) -> int | None:
+    client = _admin_immich_client(settings, admin)
+    try:
+        page = client.search_assets(
+            page=1,
+            size=1,
+            with_exif=False,
+            **_search_kwargs_from_filters(filters),
+        )
+        return page.total if page.total is not None else len(page.items)
+    except ImmichApiError as e:
+        logger.warning("admin_view_match_count_failed", error=str(e), status_code=e.status_code)
+        return None
+    finally:
+        client.close()
+
+
+def _search_kwargs_from_filters(filters: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "album_ids",
+        "person_ids",
+        "tag_ids",
+        "is_favorite",
+        "media_type",
+        "taken_after",
+        "taken_before",
+        "rating",
+        "original_file_name",
+        "ocr",
+        "city",
+        "country",
+    }
+    return {
+        key: value
+        for key, value in filters.items()
+        if key in allowed and value is not None and value != "" and value != []
+    }
+
+
+def _tag_option(tag: dict[str, Any]) -> OptionItem:
+    return OptionItem(
+        id=str(tag.get("id") or ""),
+        name=str(tag.get("name") or tag.get("value") or "Untitled tag"),
+        color=tag.get("color") if isinstance(tag.get("color"), str) else None,
+        asset_count=_optional_int(tag.get("assetCount")),
+    )
+
+
+def _person_option(person: dict[str, Any]) -> OptionItem:
+    return OptionItem(
+        id=str(person.get("id") or ""),
+        name=str(person.get("name") or person.get("birthName") or "Unnamed person"),
+        asset_count=_optional_int(person.get("assetCount")),
+        hidden=person.get("isHidden") if isinstance(person.get("isHidden"), bool) else None,
+    )
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _mount_settings(store: AdminStore) -> MountSettings:

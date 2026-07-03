@@ -593,6 +593,21 @@ class ImmichClient:
             lambda: self._request_json("GET", path),
         )
 
+    def list_tags(self) -> list[dict[str, Any]]:
+        """List Immich tags visible to the current user."""
+        payload = self._request_json("GET", "tags")
+        return list(payload) if isinstance(payload, list) else []
+
+    def list_people(self) -> list[dict[str, Any]]:
+        """List Immich people visible to the current user."""
+        payload = self._request_json("GET", "people")
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict):
+            people = payload.get("people")
+            return list(people) if isinstance(people, list) else []
+        return []
+
     def search_assets(
         self,
         *,
