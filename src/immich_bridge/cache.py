@@ -18,6 +18,7 @@ class CacheBackend(Protocol):
 
     def get_json(self, key: str) -> dict[str, Any] | None: ...
     def set_json(self, key: str, value: dict[str, Any], ttl: int = DEFAULT_TTL) -> None: ...
+    def delete_prefix(self, prefix: str) -> None: ...
     def get_int(self, key: str) -> int | None: ...
     def incr_with_ttl(self, key: str, ttl: int = DEFAULT_TTL) -> int: ...
     def clear(self) -> None: ...
@@ -53,6 +54,14 @@ class InMemoryCache:
         with self._lock:
             self._items[key] = CacheEntry(value=value, expires_at=time.time() + ttl)
         logger.debug("cache_set", key=key, backend="memory")
+
+    def delete_prefix(self, prefix: str) -> None:
+        """Delete all entries matching a logical key prefix."""
+        with self._lock:
+            keys = [key for key in self._items if key.startswith(prefix)]
+            for key in keys:
+                del self._items[key]
+        logger.info("cache_prefix_deleted", prefix=prefix, count=len(keys), backend="memory")
 
     def get_int(self, key: str) -> int | None:
         """Return an integer counter value."""
@@ -124,6 +133,30 @@ class RedisCache:
             logger.debug("cache_set", key=key, backend="redis")
         except Exception as e:
             logger.warning("redis_cache_error", operation="set_json", error=str(e))
+
+    def delete_prefix(self, prefix: str) -> None:
+        """Delete all entries matching a logical key prefix."""
+        try:
+            cursor = 0
+            deleted = 0
+            while True:
+                cursor, keys = self._redis.scan(
+                    cursor,
+                    match=f"{self._prefix}{prefix}*",
+                    count=100,
+                )
+                if keys:
+                    deleted += self._redis.delete(*keys)
+                if cursor == 0:
+                    break
+            logger.info(
+                "cache_prefix_deleted",
+                prefix=prefix,
+                count=deleted,
+                backend="redis",
+            )
+        except Exception as e:
+            logger.warning("redis_cache_error", operation="delete_prefix", error=str(e))
 
     def get_int(self, key: str) -> int | None:
         """Return an integer counter value."""

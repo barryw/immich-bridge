@@ -137,6 +137,7 @@ class ClientCompatibilityMiddleware:
         *,
         metrics_enabled: bool = False,
         max_request_body_bytes: int = 1_048_576,
+        max_upload_bytes: int = 10_737_418_240,
         max_path_length: int = 2048,
         max_path_segments: int = 32,
         max_concurrent_requests: int = 32,
@@ -146,6 +147,7 @@ class ClientCompatibilityMiddleware:
         self._app = app
         self._metrics_enabled = metrics_enabled
         self._max_request_body_bytes = max_request_body_bytes
+        self._max_upload_bytes = max_upload_bytes
         self._max_path_length = max_path_length
         self._max_path_segments = max_path_segments
         self._request_limiter = (
@@ -207,10 +209,11 @@ class ClientCompatibilityMiddleware:
                 token=token,
             )
 
-        if self._max_request_body_bytes > 0 and "wsgi.input" in environ:
+        max_body_bytes = self._max_body_bytes_for_method(method)
+        if max_body_bytes > 0 and "wsgi.input" in environ:
             environ["wsgi.input"] = LimitedInput(
                 environ["wsgi.input"],
-                self._max_request_body_bytes,
+                max_body_bytes,
             )
 
         if self._request_limiter is not None:
@@ -363,8 +366,8 @@ class ClientCompatibilityMiddleware:
             return HTTPStatus.BAD_REQUEST, "invalid Content-Length"
         if (
             content_length is not None
-            and self._max_request_body_bytes > 0
-            and content_length > self._max_request_body_bytes
+            and self._max_body_bytes_for_method(method) > 0
+            and content_length > self._max_body_bytes_for_method(method)
         ):
             return HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "request body too large"
 
@@ -381,6 +384,10 @@ class ClientCompatibilityMiddleware:
             return HTTPStatus.LENGTH_REQUIRED, "Content-Length required for write methods"
 
         return None
+
+    def _max_body_bytes_for_method(self, method: str) -> int:
+        """Return the configured body cap for a request method."""
+        return self._max_upload_bytes if method == "PUT" else self._max_request_body_bytes
 
     def _reject_request(
         self,
@@ -540,6 +547,7 @@ def create_webdav_app(
     redis_password: str | None = None,
     metrics_enabled: bool = False,
     webdav_max_request_body_bytes: int = 1_048_576,
+    webdav_max_upload_bytes: int = 10_737_418_240,
     webdav_max_path_length: int = 2048,
     webdav_max_path_segments: int = 32,
     webdav_max_concurrent_requests: int = 32,
@@ -549,6 +557,7 @@ def create_webdav_app(
     blob_cache_max_bytes: int = 1_073_741_824,
     blob_cache_max_range_bytes: int = 8_388_608,
     blob_cache_ttl_seconds: int = 86_400,
+    upload_receipt_ttl_seconds: int = 1800,
 ) -> ClientCompatibilityMiddleware:
     """Create the wsgidav WSGI application."""
     provider = ImmichProvider(
@@ -568,6 +577,7 @@ def create_webdav_app(
         blob_cache_max_bytes=blob_cache_max_bytes,
         blob_cache_max_range_bytes=blob_cache_max_range_bytes,
         blob_cache_ttl_seconds=blob_cache_ttl_seconds,
+        upload_receipt_ttl_seconds=upload_receipt_ttl_seconds,
     )
     authenticator_class = _make_authenticator_class(
         immich_url,
@@ -626,6 +636,7 @@ def create_webdav_app(
         app,
         metrics_enabled=metrics_enabled,
         max_request_body_bytes=webdav_max_request_body_bytes,
+        max_upload_bytes=webdav_max_upload_bytes,
         max_path_length=webdav_max_path_length,
         max_path_segments=webdav_max_path_segments,
         max_concurrent_requests=webdav_max_concurrent_requests,
@@ -658,6 +669,7 @@ class WebDAVServer:
         redis_password: str | None = None,
         metrics_enabled: bool = False,
         webdav_max_request_body_bytes: int = 1_048_576,
+        webdav_max_upload_bytes: int = 10_737_418_240,
         webdav_max_path_length: int = 2048,
         webdav_max_path_segments: int = 32,
         webdav_max_concurrent_requests: int = 32,
@@ -667,6 +679,7 @@ class WebDAVServer:
         blob_cache_max_bytes: int = 1_073_741_824,
         blob_cache_max_range_bytes: int = 8_388_608,
         blob_cache_ttl_seconds: int = 86_400,
+        upload_receipt_ttl_seconds: int = 1800,
     ) -> None:
         """Initialize the WebDAV server."""
         self._app = create_webdav_app(
@@ -688,6 +701,7 @@ class WebDAVServer:
             redis_password=redis_password,
             metrics_enabled=metrics_enabled,
             webdav_max_request_body_bytes=webdav_max_request_body_bytes,
+            webdav_max_upload_bytes=webdav_max_upload_bytes,
             webdav_max_path_length=webdav_max_path_length,
             webdav_max_path_segments=webdav_max_path_segments,
             webdav_max_concurrent_requests=webdav_max_concurrent_requests,
@@ -697,6 +711,7 @@ class WebDAVServer:
             blob_cache_max_bytes=blob_cache_max_bytes,
             blob_cache_max_range_bytes=blob_cache_max_range_bytes,
             blob_cache_ttl_seconds=blob_cache_ttl_seconds,
+            upload_receipt_ttl_seconds=upload_receipt_ttl_seconds,
         )
         self._server = cheroot.wsgi.Server((host, port), self._app)
         self._host = host

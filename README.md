@@ -6,9 +6,8 @@ Mount Immich like a filesystem.
 timeline views, favorites, and diagnostics through a normal DAV mount while keeping
 Immich as the source of truth for assets, metadata, permissions, and album membership.
 
-> Status: alpha. The current server is a hardened read-focused WebDAV mount. The V1
-> target is practical read/write library management: root uploads, album uploads,
-> album creation, and safe album-level deletes.
+> Status: alpha. The current server supports practical WebDAV reads and guarded
+> writes: root imports, album imports, album creation, and safe album-level deletes.
 
 ## Why
 
@@ -28,7 +27,9 @@ storage directory, touching its database, or bypassing Immich permissions.
 - Timeline and favorites browsing grouped by year, month, day, and hour when needed.
 - Original asset streaming with Range support and a bounded disk-backed range cache.
 - Redis-backed auth/cache state and DAV lock storage in the Compose deployment.
-- Read-only safety across destructive DAV operations.
+- Guarded write support: `PUT` media at root or in albums, `MKCOL` under `Albums/`,
+  and `DELETE` from album views to remove membership without deleting the asset.
+- Permanent asset deletion, overwrite, rename, move, and copy are blocked.
 - Virtual `README.txt` files at top-level directories to explain mount behavior.
 - Structured logs, request metrics toggle, Docker Compose deployment, and tests.
 
@@ -55,8 +56,9 @@ storage directory, touching its database, or bypassing Immich permissions.
 ```
 
 Top-level directories are virtual. They are not Immich storage folders. Root-level
-media uploads are planned to import into Immich and then appear through `Timeline/`,
-not as permanent root files.
+media uploads import into Immich and then appear through `Timeline/`, not as
+permanent root files. Recently uploaded root files may resolve briefly through an
+upload receipt so DAV clients can finish their post-upload checks.
 
 ## Quick Start
 
@@ -105,6 +107,8 @@ Important environment variables:
 | `DAY_FOLDER_SPLIT_THRESHOLD` | `1000` | Split large days into hour buckets |
 | `BLOB_CACHE_MAX_BYTES` | `1073741824` | Local range-cache size cap |
 | `BLOB_CACHE_MAX_RANGE_BYTES` | `8388608` | Largest single range to cache |
+| `WEBDAV_MAX_UPLOAD_BYTES` | `10737418240` | Largest accepted DAV `PUT` body |
+| `UPLOAD_RECEIPT_TTL_SECONDS` | `1800` | How long recent uploads stay directly resolvable |
 
 See `.env.example` for the full list.
 
@@ -121,18 +125,23 @@ docker compose up --build
 The test suite is intentionally focused on DAV semantics, Immich API boundaries,
 cache behavior, auth behavior, and safety around destructive operations.
 
-## Roadmap
+## Write Semantics
 
-The next V1 work is write support that feels natural in normal file managers:
+Write behavior is intentionally narrow:
 
 - `PUT /file.jpg` imports media into Immich.
 - `MKCOL /Albums/New Album` creates an Immich album.
 - `PUT /Albums/<album>/file.jpg` imports media and adds it to that album.
 - `DELETE /Albums/<album>/file.jpg` removes the asset from that album, not from the
   Immich library.
-- Permanent deletion remains opt-in only after explicit safety controls exist.
 
-Future surfaces may include tags, people, places, shares, thumbnails, upload receipts,
+Unsupported writes return an error instead of guessing. Permanent deletion remains
+disabled until explicit safety controls exist.
+
+## Roadmap
+
+Next work includes duplicate handling, richer client compatibility testing, sidecar
+files, edit-session workflows, optional thumbnails, tags, people, places, shares,
 and native filesystem clients.
 
 ## Safety Model
@@ -141,5 +150,5 @@ and native filesystem clients.
 does not mount the Immich upload directory. All authorization comes from the Immich API
 key supplied by the DAV user.
 
-Destructive operations are rejected by default. Write support will keep album
-membership changes separate from permanent asset deletion.
+Destructive asset operations are rejected by default. Album membership changes are
+kept separate from permanent asset deletion.

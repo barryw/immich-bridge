@@ -6,8 +6,10 @@ import hashlib
 import io
 import json
 import mimetypes
-from datetime import datetime, timezone
+import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, NoReturn
 
 from wsgidav.dav_error import (  # type: ignore[import-untyped]
@@ -21,6 +23,7 @@ from wsgidav.dav_error import (  # type: ignore[import-untyped]
 from wsgidav.dav_provider import DAVCollection, DAVNonCollection, DAVProvider  # type: ignore[import-untyped]
 
 from immich_bridge.blob_cache import BlobCache
+from immich_bridge.cache import get_cache
 from immich_bridge.fs_model import (
     ROOT_COLLECTIONS,
     AlbumEntry,
@@ -45,6 +48,38 @@ MACOS_METADATA_PATTERNS = (
     ".fseventsd",
 )
 README_FILENAME = "README.txt"
+UPLOAD_DEVICE_NAME = "immich-bridge-webdav"
+MEDIA_UPLOAD_EXTENSIONS = {
+    ".3gp",
+    ".ari",
+    ".arw",
+    ".avi",
+    ".avif",
+    ".cr2",
+    ".cr3",
+    ".dng",
+    ".gif",
+    ".heic",
+    ".heif",
+    ".jpeg",
+    ".jpg",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".mpeg",
+    ".mpg",
+    ".nef",
+    ".orf",
+    ".png",
+    ".raf",
+    ".raw",
+    ".rw2",
+    ".tif",
+    ".tiff",
+    ".webm",
+    ".webp",
+}
 
 
 @dataclass(frozen=True)
@@ -53,6 +88,21 @@ class ByteRange:
 
     start: int
     end: int | None = None
+
+
+def is_supported_media_upload_name(name: str) -> bool:
+    """Return whether a DAV filename is acceptable for raw Immich upload."""
+    if not name or "/" in name or name in {README_FILENAME, ".well-known"}:
+        return False
+    if name in ROOT_COLLECTIONS or is_macos_metadata_file(name):
+        return False
+    if name.startswith("."):
+        return False
+    suffix = Path(name).suffix.lower()
+    if suffix in MEDIA_UPLOAD_EXTENSIONS:
+        return True
+    guessed_type = mimetypes.guess_type(name)[0]
+    return bool(guessed_type and guessed_type.split("/", 1)[0] in {"image", "video"})
 
 
 def is_macos_metadata_file(name: str) -> bool:
@@ -136,6 +186,7 @@ class ImmichProvider(DAVProvider):  # type: ignore[misc]
         blob_cache_max_bytes: int = 1_073_741_824,
         blob_cache_max_range_bytes: int = 8_388_608,
         blob_cache_ttl_seconds: int = 86_400,
+        upload_receipt_ttl_seconds: int = 1800,
     ) -> None:
         """Initialize the provider."""
         super().__init__()
@@ -150,6 +201,7 @@ class ImmichProvider(DAVProvider):  # type: ignore[misc]
         self._day_folder_split_threshold = day_folder_split_threshold
         self._webdav_locks_enabled = webdav_locks_enabled
         self._metrics_enabled = metrics_enabled
+        self._upload_receipt_ttl_seconds = upload_receipt_ttl_seconds
         self._blob_cache = (
             BlobCache(
                 blob_cache_dir,
@@ -184,7 +236,12 @@ class ImmichProvider(DAVProvider):  # type: ignore[misc]
 
         first = parts[0]
         if first == "Albums":
-            return self._resolve_albums(normalized, parts, environ)
+            return self._resolve_albums(
+                normalized, parts, environ
+            ) or self._upload_receipt_resource(
+                normalized,
+                environ,
+            )
 
         if first in {"Timeline", "Favorites"}:
             return self._resolve_date_view(
@@ -192,13 +249,17 @@ class ImmichProvider(DAVProvider):  # type: ignore[misc]
                 parts,
                 environ,
                 is_favorite=first == "Favorites",
-            )
+            ) or self._upload_receipt_resource(normalized, environ)
 
         if parts == [".well-known"]:
             return WellKnownCollection(normalized, environ)
 
         if parts == [".well-known", "immich-bridge.json"]:
             return DiagnosticsResource(normalized, environ, self)
+
+        receipt = self._upload_receipt_resource(normalized, environ)
+        if receipt is not None:
+            return receipt
 
         return None
 
@@ -291,6 +352,73 @@ class ImmichProvider(DAVProvider):  # type: ignore[misc]
         environ.setdefault("immich_bridge.closeables", []).append(client)
         return client
 
+    def _user_scope(self, environ: dict[str, Any]) -> str | None:
+        api_key = environ.get("immich.api_key")
+        if environ.get("immich.user_id"):
+            return str(environ["immich.user_id"])
+        if api_key:
+            return hashlib.sha256(str(api_key).encode()).hexdigest()
+        return None
+
+    def _receipt_key(self, path: str, environ: dict[str, Any]) -> str | None:
+        user_scope = self._user_scope(environ)
+        if user_scope is None:
+            return None
+        digest = hashlib.sha256(path.encode()).hexdigest()
+        return f"dav-receipt:{user_scope}:{digest}"
+
+    def remember_upload_receipt(
+        self,
+        path: str,
+        environ: dict[str, Any],
+        *,
+        asset_id: str,
+        filename: str,
+        content_type: str,
+        size: int,
+    ) -> None:
+        """Remember a successful upload for short-lived direct DAV lookups."""
+        key = self._receipt_key(path, environ)
+        if key is None or self._upload_receipt_ttl_seconds <= 0:
+            return
+        get_cache().set_json(
+            key,
+            {
+                "asset_id": asset_id,
+                "filename": filename,
+                "content_type": content_type,
+                "size": size,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+            ttl=self._upload_receipt_ttl_seconds,
+        )
+
+    def _upload_receipt_resource(
+        self,
+        path: str,
+        environ: dict[str, Any],
+    ) -> "UploadReceiptResource | None":
+        key = self._receipt_key(path, environ)
+        if key is None:
+            return None
+        receipt = get_cache().get_json(key)
+        if not receipt:
+            return None
+        asset_id = receipt.get("asset_id")
+        filename = receipt.get("filename")
+        content_type = receipt.get("content_type")
+        size = receipt.get("size")
+        if not isinstance(asset_id, str) or not isinstance(filename, str):
+            return None
+        return UploadReceiptResource(
+            path,
+            environ,
+            asset_id=asset_id,
+            filename=filename,
+            content_type=content_type if isinstance(content_type, str) else None,
+            size=size if isinstance(size, int) else None,
+        )
+
     def _filesystem(self, environ: dict[str, Any]) -> ImmichFilesystem:
         existing = environ.get("immich_bridge.filesystem")
         if isinstance(existing, ImmichFilesystem):
@@ -317,6 +445,61 @@ class ImmichProvider(DAVProvider):  # type: ignore[misc]
     def _albums(self, environ: dict[str, Any]) -> list[AlbumEntry]:
         return self._run_fs(lambda: self._filesystem(environ).albums())
 
+    def create_album(self, environ: dict[str, Any], name: str) -> None:
+        """Create an Immich album for a DAV MKCOL request."""
+        try:
+            self._client(environ).create_album(name)
+            environ.pop("immich_bridge.filesystem", None)
+        except ImmichApiError as e:
+            raise _immich_error_to_dav(e) from e
+
+    def upload_asset(
+        self,
+        environ: dict[str, Any],
+        *,
+        dav_path: str,
+        filename: str,
+        file_path: Path,
+        content_type: str | None,
+        album_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Upload an asset and optionally add it to an album."""
+        try:
+            payload = self._client(environ).upload_asset(
+                file_path,
+                filename=filename,
+                content_type=content_type,
+            )
+            asset_id = str(payload["id"])
+            if album_id is not None:
+                self._client(environ).add_asset_to_album(album_id, asset_id)
+            self.remember_upload_receipt(
+                dav_path,
+                environ,
+                asset_id=asset_id,
+                filename=filename,
+                content_type=content_type or "application/octet-stream",
+                size=file_path.stat().st_size,
+            )
+            environ.pop("immich_bridge.filesystem", None)
+            return payload
+        except ImmichApiError as e:
+            raise _immich_error_to_dav(e) from e
+
+    def remove_asset_from_album(
+        self,
+        environ: dict[str, Any],
+        *,
+        album_id: str,
+        asset_id: str,
+    ) -> None:
+        """Remove an asset from an album without deleting it from Immich."""
+        try:
+            self._client(environ).remove_asset_from_album(album_id, asset_id)
+            environ.pop("immich_bridge.filesystem", None)
+        except ImmichApiError as e:
+            raise _immich_error_to_dav(e) from e
+
     def _resolve_albums(
         self,
         path: str,
@@ -341,7 +524,7 @@ class ImmichProvider(DAVProvider):  # type: ignore[misc]
             asset = self.resolve_album_asset(environ, album.album_id, parts[2])
             if asset is None:
                 return None
-            return AssetResource(path, environ, asset)
+            return AssetResource(path, environ, asset, album_id=album.album_id)
 
         bucket_parts = parts[2:]
         date_range = album_date_range_from_parts(
@@ -373,7 +556,7 @@ class ImmichProvider(DAVProvider):  # type: ignore[misc]
             )
             if asset is None:
                 return None
-            return AssetResource(path, environ, asset)
+            return AssetResource(path, environ, asset, album_id=album.album_id)
 
         if len(bucket_parts) == 5:
             day_range = album_date_range_from_parts(bucket_parts[:3])
@@ -390,7 +573,7 @@ class ImmichProvider(DAVProvider):  # type: ignore[misc]
             )
             if asset is None:
                 return None
-            return AssetResource(path, environ, asset)
+            return AssetResource(path, environ, asset, album_id=album.album_id)
 
         return None
 
@@ -745,31 +928,31 @@ class ReadOnlyResourceMixin:
         """Prevent lock discovery/creation on read-only resources."""
         return True
 
-    def create_empty_resource(self, name: str) -> NoReturn:
+    def create_empty_resource(self, name: str) -> Any:
         """Reject `PUT` or unmapped `LOCK` below this collection."""
         self._reject_write()
 
-    def create_collection(self, name: str) -> NoReturn:
+    def create_collection(self, name: str) -> Any:
         """Reject `MKCOL` below this collection."""
         self._reject_write()
 
-    def begin_write(self, *, content_type: str | None = None) -> NoReturn:
+    def begin_write(self, *, content_type: str | None = None) -> Any:
         """Reject writes to existing resources."""
         self._reject_write()
 
-    def handle_delete(self) -> NoReturn:
+    def handle_delete(self) -> Any:
         """Reject `DELETE` before recursive processing."""
         self._reject_write()
 
-    def handle_copy(self, dest_path: str, *, depth_infinity: bool) -> NoReturn:
+    def handle_copy(self, dest_path: str, *, depth_infinity: bool) -> Any:
         """Reject `COPY`."""
         self._reject_write()
 
-    def handle_move(self, dest_path: str) -> NoReturn:
+    def handle_move(self, dest_path: str) -> Any:
         """Reject `MOVE`."""
         self._reject_write()
 
-    def copy_move_single(self, dest_path: str, *, is_move: bool) -> NoReturn:
+    def copy_move_single(self, dest_path: str, *, is_move: bool) -> Any:
         """Reject fallback copy/move processing."""
         self._reject_write()
 
@@ -781,7 +964,7 @@ class ReadOnlyResourceMixin:
         """Disable recursive move for virtual collections."""
         return False
 
-    def delete(self) -> NoReturn:
+    def delete(self) -> Any:
         """Reject fallback delete processing."""
         self._reject_write()
 
@@ -828,8 +1011,218 @@ class ReadmeResource(ReadOnlyResourceMixin, DAVNonCollection):  # type: ignore[m
         return self._created_at
 
 
+class UploadSink:
+    """Writable file-like object used by WsgiDAV PUT handling."""
+
+    def __init__(self, resource: "UploadResource") -> None:
+        """Initialize the sink with a temporary file."""
+        self._resource = resource
+        self._file = tempfile.NamedTemporaryFile(  # noqa: SIM115
+            prefix="immich-bridge-upload-",
+            suffix=".tmp",
+            delete=False,
+        )
+        self._path = Path(self._file.name)
+        self._bytes_written = 0
+        self._closed = False
+        resource.set_temp_path(self._path)
+
+    def write(self, data: bytes) -> int:
+        """Write upload bytes to disk."""
+        written = self._file.write(data)
+        self._bytes_written += written
+        return written
+
+    def writelines(self, lines: Any) -> None:
+        """Write upload byte chunks to disk."""
+        for line in lines:
+            self.write(line)
+
+    def close(self) -> None:
+        """Close the temp file and publish byte count to the resource."""
+        if self._closed:
+            return
+        self._file.close()
+        self._resource.set_bytes_written(self._bytes_written)
+        self._closed = True
+
+
+class UploadResource(DAVNonCollection):  # type: ignore[misc]
+    """Transient DAV resource that uploads written bytes to Immich."""
+
+    def __init__(
+        self,
+        path: str,
+        environ: dict[str, Any],
+        *,
+        filename: str,
+        album_id: str | None = None,
+    ) -> None:
+        """Initialize the upload target."""
+        super().__init__(path, environ)
+        self._filename = filename
+        self._album_id = album_id
+        self._content_type: str | None = None
+        self._temp_path: Path | None = None
+        self._bytes_written = 0
+        self._uploaded_payload: dict[str, Any] | None = None
+        self._created_at = datetime.now(timezone.utc).timestamp()
+
+    @property
+    def _immich_provider(self) -> ImmichProvider:
+        return self.provider  # type: ignore[return-value]
+
+    def set_temp_path(self, path: Path) -> None:
+        """Record the active upload temp path."""
+        self._temp_path = path
+
+    def set_bytes_written(self, byte_count: int) -> None:
+        """Record the uploaded byte count."""
+        self._bytes_written = byte_count
+
+    def begin_write(self, *, content_type: str | None = None) -> UploadSink:
+        """Open a disk-backed sink for DAV upload bytes."""
+        self._content_type = content_type or mimetypes.guess_type(self._filename)[0]
+        return UploadSink(self)
+
+    def end_write(self, *, with_errors: bool) -> None:
+        """Upload the completed temp file to Immich."""
+        temp_path = self._temp_path
+        try:
+            if with_errors:
+                return
+            if temp_path is None or not temp_path.exists():
+                raise DAVError(HTTP_INSUFFICIENT_STORAGE, "Upload body was not staged")
+            self._uploaded_payload = self._immich_provider.upload_asset(
+                self.environ,
+                dav_path=self.path,
+                filename=self._filename,
+                file_path=temp_path,
+                content_type=self._content_type,
+                album_id=self._album_id,
+            )
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("upload_temp_cleanup_failed", path=str(temp_path))
+
+    def get_content_length(self) -> int:
+        """Return staged upload length."""
+        return self._bytes_written
+
+    def get_content_type(self) -> str:
+        """Return upload MIME type."""
+        return self._content_type or "application/octet-stream"
+
+    def get_content(self) -> io.BytesIO:
+        """Return empty content for transient upload resources."""
+        return io.BytesIO()
+
+    def support_etag(self) -> bool:
+        """Return whether an upload response ETag is available."""
+        return self._uploaded_payload is not None
+
+    def get_etag(self) -> str | None:
+        """Return an ETag based on uploaded asset id."""
+        if not self._uploaded_payload:
+            return None
+        return hashlib.sha1(str(self._uploaded_payload.get("id", "")).encode()).hexdigest()
+
+    def get_creation_date(self) -> float:
+        """Return creation timestamp."""
+        return self._created_at
+
+    def get_last_modified(self) -> float:
+        """Return modified timestamp."""
+        return self._created_at
+
+
+class UploadReceiptResource(ReadOnlyResourceMixin, DAVNonCollection):  # type: ignore[misc]
+    """Short-lived virtual resource for recently uploaded files."""
+
+    def __init__(
+        self,
+        path: str,
+        environ: dict[str, Any],
+        *,
+        asset_id: str,
+        filename: str,
+        content_type: str | None,
+        size: int | None,
+    ) -> None:
+        """Initialize the upload receipt resource."""
+        super().__init__(path, environ)
+        self._asset_id = asset_id
+        self._filename = filename
+        self._content_type = content_type
+        self._size = size
+        self._created_at = datetime.now(timezone.utc).timestamp()
+
+    @property
+    def _immich_provider(self) -> ImmichProvider:
+        return self.provider  # type: ignore[return-value]
+
+    def get_display_name(self) -> str:
+        """Return the uploaded filename."""
+        return self._filename
+
+    def get_content_length(self) -> int | None:
+        """Return uploaded byte length when known."""
+        return self._size
+
+    def get_content_type(self) -> str:
+        """Return upload MIME type."""
+        return (
+            self._content_type
+            or mimetypes.guess_type(self._filename)[0]
+            or "application/octet-stream"
+        )
+
+    def get_content(self) -> io.IOBase:
+        """Stream the recently uploaded asset from Immich."""
+        byte_range = byte_range_from_header(self.environ.get("HTTP_RANGE"))
+        try:
+            return self._immich_provider._client(self.environ).open_original(
+                self._asset_id,
+                range_start=byte_range.start if byte_range is not None else None,
+                range_end=byte_range.end if byte_range is not None else None,
+            )
+        except ImmichApiError as e:
+            raise _immich_error_to_dav(e) from e
+
+    def support_ranges(self) -> bool:
+        """Return whether byte ranges can be proxied for this receipt."""
+        return self._size is not None
+
+    def support_etag(self) -> bool:
+        """Return stable ETags for upload receipts."""
+        return True
+
+    def get_etag(self) -> str:
+        """Return an ETag based on the uploaded asset id."""
+        return hashlib.sha1(self._asset_id.encode()).hexdigest()
+
+    def get_creation_date(self) -> float:
+        """Return creation timestamp."""
+        return self._created_at
+
+    def get_last_modified(self) -> float:
+        """Return modified timestamp."""
+        return self._created_at
+
+
 class RootResource(ReadOnlyResourceMixin, DAVCollection):  # type: ignore[misc]
     """WebDAV collection representing the root directory."""
+
+    def create_empty_resource(self, name: str) -> UploadResource | MacOSMetadataResource:
+        """Treat root PUT as a raw Immich library upload."""
+        if is_macos_metadata_file(name):
+            return MacOSMetadataResource(f"/{name}", self.environ)
+        if not is_supported_media_upload_name(name):
+            raise DAVError(HTTP_FORBIDDEN)
+        return UploadResource(f"/{name}", self.environ, filename=name)
 
     def get_member_names(self) -> list[str]:
         """Return V1 root collection names."""
@@ -867,6 +1260,18 @@ class AlbumsRootCollection(ReadOnlyResourceMixin, DAVCollection):  # type: ignor
             README_FILENAME,
             *[entry.name for entry in self._immich_provider._albums(self.environ)],
         ]
+
+    def create_empty_resource(self, name: str) -> MacOSMetadataResource:
+        """Discard harmless client metadata, but reject files directly under Albums."""
+        if is_macos_metadata_file(name):
+            return MacOSMetadataResource(f"{self.path.rstrip('/')}/{name}", self.environ)
+        raise DAVError(HTTP_FORBIDDEN)
+
+    def create_collection(self, name: str) -> None:
+        """Create an Immich album."""
+        if name == README_FILENAME or is_macos_metadata_file(name):
+            raise DAVError(HTTP_FORBIDDEN)
+        self._immich_provider.create_album(self.environ, name)
 
     def get_member(self, name: str) -> "ReadmeResource | AlbumCollection | None":
         """Return an album folder."""
@@ -914,6 +1319,19 @@ class AlbumCollection(ReadOnlyResourceMixin, DAVCollection):  # type: ignore[mis
             self._immich_provider.list_album_assets(self.environ, self._album.album_id).keys()
         )
 
+    def create_empty_resource(self, name: str) -> UploadResource | MacOSMetadataResource:
+        """Upload a new asset and add it to this album."""
+        if is_macos_metadata_file(name):
+            return MacOSMetadataResource(f"{self.path.rstrip('/')}/{name}", self.environ)
+        if not is_supported_media_upload_name(name):
+            raise DAVError(HTTP_FORBIDDEN)
+        return UploadResource(
+            f"{self.path.rstrip('/')}/{name}",
+            self.environ,
+            filename=name,
+            album_id=self._album.album_id,
+        )
+
     def get_member(self, name: str) -> "AlbumDateBucketCollection | AssetResource | None":
         """Return a date bucket for large albums or an album asset file."""
         if self._immich_provider.should_split_album(self._album):
@@ -930,7 +1348,12 @@ class AlbumCollection(ReadOnlyResourceMixin, DAVCollection):  # type: ignore[mis
         asset = self._immich_provider.resolve_album_asset(self.environ, self._album.album_id, name)
         if asset is None:
             return None
-        return AssetResource(f"{self.path.rstrip('/')}/{name}", self.environ, asset)
+        return AssetResource(
+            f"{self.path.rstrip('/')}/{name}",
+            self.environ,
+            asset,
+            album_id=self._album.album_id,
+        )
 
 
 class AlbumDateBucketCollection(ReadOnlyResourceMixin, DAVCollection):  # type: ignore[misc]
@@ -1033,7 +1456,12 @@ class AlbumDateBucketCollection(ReadOnlyResourceMixin, DAVCollection):  # type: 
         )
         if asset is None:
             return None
-        return AssetResource(f"{self.path.rstrip('/')}/{name}", self.environ, asset)
+        return AssetResource(
+            f"{self.path.rstrip('/')}/{name}",
+            self.environ,
+            asset,
+            album_id=self._album.album_id,
+        )
 
 
 class AlbumHourBucketCollection(ReadOnlyResourceMixin, DAVCollection):  # type: ignore[misc]
@@ -1079,7 +1507,12 @@ class AlbumHourBucketCollection(ReadOnlyResourceMixin, DAVCollection):  # type: 
         )
         if asset is None:
             return None
-        return AssetResource(f"{self.path.rstrip('/')}/{name}", self.environ, asset)
+        return AssetResource(
+            f"{self.path.rstrip('/')}/{name}",
+            self.environ,
+            asset,
+            album_id=self._album.album_id,
+        )
 
 
 class DateRootCollection(ReadOnlyResourceMixin, DAVCollection):  # type: ignore[misc]
@@ -1338,8 +1771,13 @@ class DiagnosticsResource(ReadOnlyResourceMixin, DAVNonCollection):  # type: ign
             "capabilities": {
                 "webdav": True,
                 "nativeFsApi": False,
-                "readOnly": True,
-                "writes": False,
+                "readOnly": False,
+                "writes": True,
+                "rootUploads": True,
+                "albumUploads": True,
+                "albumCreate": True,
+                "albumMembershipDelete": True,
+                "permanentDelete": False,
                 "rangeReads": True,
                 "locks": bool(provider and provider._webdav_locks_enabled),
                 "blobCache": bool(provider and provider._blob_cache),
@@ -1398,10 +1836,18 @@ class DiagnosticsResource(ReadOnlyResourceMixin, DAVNonCollection):  # type: ign
 class AssetResource(ReadOnlyResourceMixin, DAVNonCollection):  # type: ignore[misc]
     """WebDAV file resource that streams an Immich original asset."""
 
-    def __init__(self, path: str, environ: dict[str, Any], asset: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        path: str,
+        environ: dict[str, Any],
+        asset: dict[str, Any],
+        *,
+        album_id: str | None = None,
+    ) -> None:
         """Initialize an asset resource."""
         super().__init__(path, environ)
         self._asset = asset
+        self._album_id = album_id
 
     @property
     def _immich_provider(self) -> ImmichProvider:
@@ -1432,6 +1878,21 @@ class AssetResource(ReadOnlyResourceMixin, DAVNonCollection):  # type: ignore[mi
             )
         except ImmichApiError as e:
             raise _immich_error_to_dav(e) from e
+
+    def handle_delete(self) -> bool:
+        """Remove album membership for album-scoped assets."""
+        if self._album_id is None:
+            self._reject_write()
+        self._immich_provider.remove_asset_from_album(
+            self.environ,
+            album_id=self._album_id,
+            asset_id=str(self._asset["id"]),
+        )
+        return True
+
+    def delete(self) -> None:
+        """Fallback delete handler used by WsgiDAV."""
+        self.handle_delete()
 
     def support_ranges(self) -> bool:
         """Return whether byte ranges can be proxied for this asset."""

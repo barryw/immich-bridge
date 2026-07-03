@@ -1,18 +1,22 @@
 """Tests for the V1 WebDAV provider."""
 
+import io
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
-from wsgidav.dav_error import HTTP_FORBIDDEN, DAVError
+from wsgidav.dav_error import HTTP_BAD_GATEWAY, HTTP_FORBIDDEN, DAVError
 
-from immich_bridge.immich_client import SearchPage
+from immich_bridge.immich_client import ImmichApiError, SearchPage
 from immich_bridge.webdav_provider import (
     AlbumDateBucketCollection,
     ImmichProvider,
+    MacOSMetadataResource,
     README_FILENAME,
     ReadmeResource,
     RootResource,
+    UploadReceiptResource,
     byte_range_from_header,
     is_macos_metadata_file,
     range_start_from_header,
@@ -35,6 +39,12 @@ ASSET_CAPTURE_TIME = "2026-06-28T16:38:37.120Z"
 
 class FakeImmichClient:
     """Small fake for provider tests."""
+
+    def __init__(self) -> None:
+        self.created_albums: list[str] = []
+        self.uploads: list[dict[str, Any]] = []
+        self.album_adds: list[tuple[str, str]] = []
+        self.album_removes: list[tuple[str, str]] = []
 
     def list_albums(self) -> list[dict[str, Any]]:
         """Return a visible album."""
@@ -70,11 +80,62 @@ class FakeImmichClient:
             return []
         return [{"timeBucket": "2026-06-01", "count": 1}]
 
+    def create_album(self, name: str) -> dict[str, Any]:
+        """Record album creation."""
+        self.created_albums.append(name)
+        return {"id": "created-album", "albumName": name}
+
+    def upload_asset(
+        self,
+        file_path: str | Path,
+        *,
+        filename: str,
+        content_type: str | None = None,
+    ) -> dict[str, Any]:
+        """Record an upload."""
+        data = Path(file_path).read_bytes()
+        self.uploads.append(
+            {
+                "filename": filename,
+                "content_type": content_type,
+                "data": data,
+            }
+        )
+        return {"id": f"uploaded-{len(self.uploads)}", "status": "created"}
+
+    def add_asset_to_album(self, album_id: str, asset_id: str) -> None:
+        """Record album membership add."""
+        self.album_adds.append((album_id, asset_id))
+
+    def remove_asset_from_album(self, album_id: str, asset_id: str) -> None:
+        """Record album membership removal."""
+        self.album_removes.append((album_id, asset_id))
+
+    def open_original(self, asset_id: str, **kwargs: Any) -> io.BytesIO:
+        """Return uploaded content for receipt tests."""
+        return io.BytesIO(b"uploaded")
+
+
+class FailingAlbumAddClient(FakeImmichClient):
+    """Fake that uploads successfully but fails album membership add."""
+
+    def add_asset_to_album(self, album_id: str, asset_id: str) -> None:
+        """Record and fail album membership add."""
+        self.album_adds.append((album_id, asset_id))
+        raise ImmichApiError("album add failed", status_code=500)
+
 
 def provider_with_fake_client() -> ImmichProvider:
     """Return a provider that uses fake Immich data."""
     provider = ImmichProvider("http://immich.test/api")
     provider._client = lambda environ: FakeImmichClient()  # type: ignore[method-assign]
+    return provider
+
+
+def provider_with_client(client: FakeImmichClient) -> ImmichProvider:
+    """Return a provider backed by a specific fake client."""
+    provider = ImmichProvider("http://immich.test/api")
+    provider._client = lambda environ: client  # type: ignore[method-assign]
     return provider
 
 
@@ -206,8 +267,8 @@ def test_virtual_readmes_are_only_files_at_top_level_directories() -> None:
     assert provider.get_resource_inst("/Favorites/IMG_0001.jpg", auth_environ()) is None
 
 
-def test_root_rejects_create_delete_and_move_operations() -> None:
-    """The fixed root namespace should not be writable."""
+def test_root_rejects_non_media_collection_delete_and_move_operations() -> None:
+    """The fixed root namespace should only accept media file uploads."""
     provider = ImmichProvider("http://immich.test/api")
     resource = provider.get_resource_inst("/", {"immich.username": "barry"})
 
@@ -224,6 +285,84 @@ def test_root_rejects_create_delete_and_move_operations() -> None:
         with pytest.raises(DAVError) as exc_info:
             operation()
         assert exc_info.value.value == HTTP_FORBIDDEN
+
+
+def test_root_discards_macos_metadata_writes() -> None:
+    """Finder metadata writes should not become Immich uploads."""
+    client = FakeImmichClient()
+    provider = provider_with_client(client)
+    root = provider.get_resource_inst("/", auth_environ())
+
+    assert isinstance(root, RootResource)
+    metadata = root.create_empty_resource(".DS_Store")
+    assert isinstance(metadata, MacOSMetadataResource)
+    sink = metadata.begin_write(content_type="application/octet-stream")
+    assert sink.write(b"finder-noise") == len(b"finder-noise")
+    sink.close()
+    metadata.end_write(with_errors=False)
+
+    assert client.uploads == []
+
+
+def test_root_put_uploads_media_and_creates_receipt() -> None:
+    """Root PUT should upload media without listing it as a root child."""
+    client = FakeImmichClient()
+    provider = provider_with_client(client)
+    environ = auth_environ()
+    root = provider.get_resource_inst("/", environ)
+
+    assert isinstance(root, RootResource)
+    upload = root.create_empty_resource("IMG_0001.jpg")
+    sink = upload.begin_write(content_type="image/jpeg")
+    sink.write(b"image-bytes")
+    sink.close()
+    upload.end_write(with_errors=False)
+
+    assert client.uploads == [
+        {
+            "filename": "IMG_0001.jpg",
+            "content_type": "image/jpeg",
+            "data": b"image-bytes",
+        }
+    ]
+    assert "IMG_0001.jpg" not in root.get_member_names()
+
+    receipt = provider.get_resource_inst("/IMG_0001.jpg", environ)
+    assert isinstance(receipt, UploadReceiptResource)
+    assert receipt.get_content_length() == len(b"image-bytes")
+    assert receipt.get_content_type() == "image/jpeg"
+
+
+def test_root_put_with_errors_cleans_staged_file_and_skips_upload() -> None:
+    """Aborted PUTs should clean their temp file without calling Immich."""
+    client = FakeImmichClient()
+    provider = provider_with_client(client)
+    root = provider.get_resource_inst("/", auth_environ())
+
+    assert isinstance(root, RootResource)
+    upload = root.create_empty_resource("IMG_0001.jpg")
+    sink = upload.begin_write(content_type="image/jpeg")
+    sink.write(b"partial-image")
+    sink.close()
+    temp_path = upload._temp_path
+    assert temp_path is not None
+    assert temp_path.exists()
+
+    upload.end_write(with_errors=True)
+
+    assert not temp_path.exists()
+    assert client.uploads == []
+
+
+def test_root_put_rejects_non_media_files() -> None:
+    """Root upload target should only accept media-like filenames."""
+    provider = provider_with_fake_client()
+    root = provider.get_resource_inst("/", auth_environ())
+
+    assert isinstance(root, RootResource)
+    with pytest.raises(DAVError) as exc_info:
+        root.create_empty_resource("notes.txt")
+    assert exc_info.value.value == HTTP_FORBIDDEN
 
 
 def test_top_level_collections_reject_delete_and_move_operations() -> None:
@@ -244,6 +383,91 @@ def test_top_level_collections_reject_delete_and_move_operations() -> None:
         assert exc_info.value.value == HTTP_FORBIDDEN
 
 
+def test_albums_root_mkcol_creates_album_but_rejects_files() -> None:
+    """MKCOL below Albums creates albums; PUT below Albums remains forbidden."""
+    client = FakeImmichClient()
+    provider = provider_with_client(client)
+    albums = provider.get_resource_inst("/Albums", auth_environ())
+
+    assert albums is not None
+    albums.create_collection("New Album")
+    assert client.created_albums == ["New Album"]
+
+    with pytest.raises(DAVError) as exc_info:
+        albums.create_empty_resource("IMG_0001.jpg")
+    assert exc_info.value.value == HTTP_FORBIDDEN
+
+
+def test_album_put_uploads_and_adds_to_album() -> None:
+    """PUT inside an album should upload then add the new asset to that album."""
+    client = FakeImmichClient()
+    provider = provider_with_client(client)
+    album = provider.get_resource_inst("/Albums/Vacation-2026", auth_environ())
+
+    assert album is not None
+    upload = album.create_empty_resource("IMG_0002.heic")
+    sink = upload.begin_write(content_type="image/heic")
+    sink.write(b"heic-bytes")
+    sink.close()
+    upload.end_write(with_errors=False)
+
+    assert client.uploads[0]["filename"] == "IMG_0002.heic"
+    assert client.uploads[0]["data"] == b"heic-bytes"
+    assert client.album_adds == [("album-1", "uploaded-1")]
+
+
+def test_album_put_album_add_failure_cleans_staged_file() -> None:
+    """Partial album upload failures should surface as DAV errors and clean temp files."""
+    client = FailingAlbumAddClient()
+    provider = provider_with_client(client)
+    album = provider.get_resource_inst("/Albums/Vacation-2026", auth_environ())
+
+    assert album is not None
+    upload = album.create_empty_resource("IMG_0002.heic")
+    sink = upload.begin_write(content_type="image/heic")
+    sink.write(b"heic-bytes")
+    sink.close()
+    temp_path = upload._temp_path
+    assert temp_path is not None
+    assert temp_path.exists()
+
+    with pytest.raises(DAVError) as exc_info:
+        upload.end_write(with_errors=False)
+
+    assert exc_info.value.value == HTTP_BAD_GATEWAY
+    assert not temp_path.exists()
+    assert client.uploads[0]["filename"] == "IMG_0002.heic"
+    assert client.album_adds == [("album-1", "uploaded-1")]
+
+
+def test_album_delete_removes_membership_without_deleting_asset() -> None:
+    """DELETE on an album asset should remove album membership only."""
+    client = FakeImmichClient()
+    provider = provider_with_client(client)
+    asset = provider.get_resource_inst(
+        "/Albums/Vacation-2026/2026-06-28 16.38.37 IMG-0001--c1ada054.heic",
+        auth_environ(),
+    )
+
+    assert asset is not None
+    assert asset.handle_delete() is True
+    assert client.album_removes == [("album-1", ASSET["id"])]
+
+
+def test_timeline_delete_remains_forbidden() -> None:
+    """Virtual timeline assets should not map DELETE to permanent deletion."""
+    provider = provider_with_fake_client()
+    asset = provider.get_resource_inst(
+        "/Timeline/2026/2026-06/2026-06-28/2026-06-28 16.38.37 IMG-0001--c1ada054.heic",
+        auth_environ(),
+    )
+
+    assert asset is not None
+    with pytest.raises(DAVError) as exc_info:
+        asset.handle_delete()
+    assert exc_info.value.value == HTTP_FORBIDDEN
+
+
 def test_diagnostics_resource_contains_identity() -> None:
     """Diagnostics file should include authenticated Immich identity."""
     provider = ImmichProvider("http://immich.test/api")
@@ -262,8 +486,11 @@ def test_diagnostics_resource_contains_identity() -> None:
     assert payload["immichUrl"] == "http://immich.test/api"
     assert payload["user"] == "barry@example.com"
     assert payload["userId"] == "user-1"
-    assert payload["capabilities"]["readOnly"] is True
-    assert payload["capabilities"]["writes"] is False
+    assert payload["capabilities"]["readOnly"] is False
+    assert payload["capabilities"]["writes"] is True
+    assert payload["capabilities"]["rootUploads"] is True
+    assert payload["capabilities"]["albumMembershipDelete"] is True
+    assert payload["capabilities"]["permanentDelete"] is False
     assert payload["capabilities"]["locks"] is False
     assert payload["limits"]["searchMaxPages"] == 20
 

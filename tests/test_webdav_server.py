@@ -145,6 +145,59 @@ def test_client_middleware_rejects_oversized_request_bodies() -> None:
     app.assert_not_called()
 
 
+def test_client_middleware_uses_separate_upload_body_limit() -> None:
+    """PUT uploads should use the upload cap, not the metadata request cap."""
+    calls = 0
+    statuses: list[str] = []
+
+    def app(environ: dict[str, object], start_response: object) -> list[bytes]:
+        nonlocal calls
+        calls += 1
+        start_response("201 Created", [])  # type: ignore[operator]
+        return [b""]
+
+    def start_response(
+        status: str,
+        response_headers: list[tuple[str, str]],
+        exc_info: object = None,
+    ) -> None:
+        statuses.append(status)
+
+    middleware = ClientCompatibilityMiddleware(  # type: ignore[arg-type]
+        app,
+        max_request_body_bytes=4,
+        max_upload_bytes=8,
+    )
+    accepted_body = list(
+        middleware(
+            {
+                "REQUEST_METHOD": "PUT",
+                "PATH_INFO": "/IMG_0001.jpg",
+                "CONTENT_LENGTH": "8",
+                "HTTP_X_REQUEST_ID": "req-upload-ok",
+            },
+            start_response,
+        )
+    )
+    rejected_body = list(
+        middleware(
+            {
+                "REQUEST_METHOD": "PUT",
+                "PATH_INFO": "/IMG_0002.jpg",
+                "CONTENT_LENGTH": "9",
+                "HTTP_X_REQUEST_ID": "req-upload-large",
+            },
+            start_response,
+        )
+    )
+
+    assert calls == 1
+    assert statuses[0] == "201 Created"
+    assert statuses[1].startswith("413 ")
+    assert accepted_body == [b""]
+    assert rejected_body[0].endswith(b": request body too large\n")
+
+
 def test_client_middleware_caps_wsgi_input_reads() -> None:
     """Bodies without Content-Length should still be capped during reads."""
     statuses: list[str] = []

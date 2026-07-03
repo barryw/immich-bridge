@@ -245,8 +245,13 @@ WebDAV has no good standard pagination model for mounted file managers. The serv
   "immichUrl": "https://immich.example.com",
   "user": "barry@example.com",
   "capabilities": {
-    "readOnly": true,
-    "writes": false,
+    "readOnly": false,
+    "writes": true,
+    "rootUploads": true,
+    "albumUploads": true,
+    "albumCreate": true,
+    "albumMembershipDelete": true,
+    "permanentDelete": false,
     "rangeReads": true,
     "locks": true,
     "nativeFsApi": false

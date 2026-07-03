@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import atexit
+import base64
 import hashlib
 import io
 import json
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
@@ -93,6 +96,20 @@ def _parse_optional_int(value: str | None) -> int | None:
         return int(value)
     except ValueError:
         return None
+
+
+def _file_sha1_base64(path: Path) -> str:
+    """Return base64-encoded SHA-1 digest for an upload file."""
+    digest = hashlib.sha1()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return base64.b64encode(digest.digest()).decode("ascii")
+
+
+def _utc_iso_from_timestamp(timestamp: float) -> str:
+    """Return an Immich-compatible UTC ISO timestamp."""
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
 
 
 class OriginalResponseFactory(Protocol):
@@ -428,6 +445,9 @@ class ImmichClient:
                     status_code=response.status_code,
                 )
 
+            if not response.content:
+                return {}
+
             try:
                 return response.json()
             except ValueError as e:
@@ -445,6 +465,107 @@ class ImmichClient:
             self._album_cache_ttl_seconds,
             lambda: self._request_json("GET", "albums"),
         )
+
+    def _invalidate_metadata_cache(self) -> None:
+        """Invalidate cached Immich metadata for this user."""
+        get_cache().delete_prefix(f"immich:{self._user_scope}:")
+
+    def create_album(self, name: str) -> dict[str, Any]:
+        """Create an Immich album."""
+        payload = self._request_json(
+            "POST",
+            "albums",
+            json_body={"albumName": name, "assetIds": []},
+        )
+        self._invalidate_metadata_cache()
+        return payload if isinstance(payload, dict) else {}
+
+    def add_asset_to_album(self, album_id: str, asset_id: str) -> Any:
+        """Add an asset to an Immich album."""
+        payload = self._request_json(
+            "PUT",
+            f"albums/{album_id}/assets",
+            json_body={"ids": [asset_id]},
+        )
+        self._invalidate_metadata_cache()
+        return payload
+
+    def remove_asset_from_album(self, album_id: str, asset_id: str) -> Any:
+        """Remove an asset from an Immich album without deleting the asset."""
+        payload = self._request_json(
+            "DELETE",
+            f"albums/{album_id}/assets",
+            json_body={"ids": [asset_id]},
+        )
+        self._invalidate_metadata_cache()
+        return payload
+
+    def upload_asset(
+        self,
+        file_path: str | Path,
+        *,
+        filename: str,
+        content_type: str | None = None,
+    ) -> dict[str, Any]:
+        """Upload one asset to Immich without retrying the multipart body."""
+        path = Path(file_path)
+        modified_at = _utc_iso_from_timestamp(path.stat().st_mtime)
+        checksum = _file_sha1_base64(path)
+        headers = {
+            **self._headers(),
+            "x-immich-checksum": checksum,
+        }
+        data = {
+            "deviceAssetId": f"immich-bridge:{checksum}",
+            "deviceId": "immich-bridge-webdav",
+            "fileCreatedAt": modified_at,
+            "fileModifiedAt": modified_at,
+        }
+        started_at = time.perf_counter()
+        status_code: int | None = None
+        try:
+            with path.open("rb") as file:
+                response = self._http_client.post(
+                    self._url("assets"),
+                    headers=headers,
+                    data=data,
+                    files={
+                        "assetData": (
+                            filename,
+                            file,
+                            content_type or "application/octet-stream",
+                        )
+                    },
+                )
+                status_code = response.status_code
+        except (httpx.TimeoutException, httpx.RequestError) as e:
+            raise ImmichApiError(str(e)) from e
+        finally:
+            elapsed_ms = (time.perf_counter() - started_at) * 1000
+            logger.info(
+                "immich_asset_upload",
+                request_id=get_request_id(),
+                filename=filename,
+                bytes=path.stat().st_size if path.exists() else None,
+                status=status_code,
+                elapsed_ms=round(elapsed_ms, 2),
+            )
+
+        if response.status_code >= 400:
+            raise ImmichApiError(
+                f"Immich API returned HTTP {response.status_code}",
+                status_code=response.status_code,
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as e:
+            raise ImmichApiError("Immich API returned invalid JSON") from e
+        if not isinstance(payload, dict) or not payload.get("id"):
+            raise ImmichApiError("Immich upload response did not include an asset id")
+
+        self._invalidate_metadata_cache()
+        return payload
 
     def get_asset(self, asset_id: str) -> dict[str, Any]:
         """Fetch one asset by ID."""

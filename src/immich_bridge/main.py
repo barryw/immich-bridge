@@ -62,6 +62,7 @@ def run_servers() -> None:
         redis_password=redis_password,
         metrics_enabled=settings.immich_bridge_metrics,
         webdav_max_request_body_bytes=settings.webdav_max_request_body_bytes,
+        webdav_max_upload_bytes=settings.webdav_max_upload_bytes,
         webdav_max_path_length=settings.webdav_max_path_length,
         webdav_max_path_segments=settings.webdav_max_path_segments,
         webdav_max_concurrent_requests=settings.webdav_max_concurrent_requests,
@@ -71,6 +72,7 @@ def run_servers() -> None:
         blob_cache_max_bytes=settings.blob_cache_max_bytes,
         blob_cache_max_range_bytes=settings.blob_cache_max_range_bytes,
         blob_cache_ttl_seconds=settings.blob_cache_ttl_seconds,
+        upload_receipt_ttl_seconds=settings.upload_receipt_ttl_seconds,
     )
 
     webdav_thread = threading.Thread(target=webdav_server.start, daemon=True)

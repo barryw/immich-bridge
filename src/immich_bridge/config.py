@@ -40,6 +40,10 @@ class Settings(BaseSettings):
         default=1_048_576,
         description="Maximum accepted WebDAV request body size",
     )
+    webdav_max_upload_bytes: int = Field(
+        default=10_737_418_240,
+        description="Maximum accepted WebDAV PUT upload body size",
+    )
     webdav_max_path_length: int = Field(
         default=2048,
         description="Maximum accepted WebDAV path length in bytes",
@@ -75,6 +79,10 @@ class Settings(BaseSettings):
     blob_cache_ttl_seconds: int = Field(
         default=86_400,
         description="Local disk cache TTL for original-asset byte ranges",
+    )
+    upload_receipt_ttl_seconds: int = Field(
+        default=1800,
+        description="Short-lived DAV receipt TTL after uploads",
     )
 
     log_level: str = Field(default="INFO")

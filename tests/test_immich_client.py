@@ -1,5 +1,6 @@
 """Tests for the Immich API client."""
 
+import json
 from typing import Any
 from unittest.mock import patch
 
@@ -225,3 +226,88 @@ def test_original_stream_metrics_logs_open_and_close_events() -> None:
     assert events[0][1]["response_content_length"] == 3
     assert events[1][1]["bytes_read"] == 1
     assert events[1][1]["read_calls"] == 1
+
+
+def test_create_album_add_and_remove_asset_send_expected_requests() -> None:
+    """Album write helpers should use Immich album APIs and invalidate caches."""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST" and request.url.path == "/api/albums":
+            return httpx.Response(201, json={"id": "album-2"})
+        if request.method == "PUT" and request.url.path == "/api/albums/album-2/assets":
+            return httpx.Response(200, json=[{"id": "asset-1", "success": True}])
+        if request.method == "DELETE" and request.url.path == "/api/albums/album-2/assets":
+            return httpx.Response(200, json=[{"id": "asset-1", "success": True}])
+        return httpx.Response(404)
+
+    client = ImmichClient(
+        base_url="http://immich.test/api",
+        api_key="api-key",
+        user_scope="user-1",
+    )
+    client._http_client.close()
+    client._http_client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    with patch("immich_bridge.immich_client.get_cache") as mock_get_cache:
+        cache = mock_get_cache.return_value
+        assert client.create_album("New Album") == {"id": "album-2"}
+        assert client.add_asset_to_album("album-2", "asset-1") == [
+            {"id": "asset-1", "success": True}
+        ]
+        assert client.remove_asset_from_album("album-2", "asset-1") == [
+            {"id": "asset-1", "success": True}
+        ]
+
+    client.close()
+
+    assert [request.method for request in requests] == ["POST", "PUT", "DELETE"]
+    assert json.loads(requests[0].content) == {"albumName": "New Album", "assetIds": []}
+    assert json.loads(requests[1].content) == {"ids": ["asset-1"]}
+    assert json.loads(requests[2].content) == {"ids": ["asset-1"]}
+    assert cache.delete_prefix.call_count == 3
+    cache.delete_prefix.assert_called_with("immich:user-1:")
+
+
+def test_upload_asset_sends_multipart_and_returns_asset_id(tmp_path) -> None:
+    """Asset uploads should use Immich multipart API without retrying."""
+    upload_file = tmp_path / "IMG_0001.jpg"
+    upload_file.write_bytes(b"image-bytes")
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "POST"
+        assert request.url.path == "/api/assets"
+        assert request.headers["x-api-key"] == "api-key"
+        assert request.headers["x-immich-checksum"]
+        assert request.headers["content-type"].startswith("multipart/form-data;")
+        body = request.content
+        assert b'name="deviceAssetId"' in body
+        assert b"immich-bridge:" in body
+        assert b'name="deviceId"' in body
+        assert b"immich-bridge-webdav" in body
+        assert b'name="assetData"; filename="IMG_0001.jpg"' in body
+        assert b"image-bytes" in body
+        return httpx.Response(201, json={"id": "asset-1", "status": "created"})
+
+    client = ImmichClient(
+        base_url="http://immich.test/api",
+        api_key="api-key",
+        user_scope="user-1",
+    )
+    client._http_client.close()
+    client._http_client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    with patch("immich_bridge.immich_client.get_cache") as mock_get_cache:
+        assert client.upload_asset(
+            upload_file,
+            filename="IMG_0001.jpg",
+            content_type="image/jpeg",
+        ) == {"id": "asset-1", "status": "created"}
+
+    client.close()
+
+    assert len(requests) == 1
+    mock_get_cache.return_value.delete_prefix.assert_called_once_with("immich:user-1:")
