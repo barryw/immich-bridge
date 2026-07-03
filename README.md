@@ -3,8 +3,9 @@
 Mount Immich like a filesystem.
 
 `immich-bridge` is a standalone WebDAV bridge for Immich libraries. It exposes albums,
-timeline views, favorites, and diagnostics through a normal DAV mount while keeping
-Immich as the source of truth for assets, metadata, permissions, and album membership.
+timeline views, favorites, saved views, and diagnostics through a normal DAV mount
+while keeping Immich as the source of truth for assets, metadata, permissions, and
+album membership.
 
 > Status: alpha. The current server supports practical WebDAV reads and guarded
 > writes: root imports, album imports, album creation, and safe album-level deletes.
@@ -21,8 +22,10 @@ storage directory, touching its database, or bypassing Immich permissions.
 ## What Works Today
 
 - WebDAV Basic Auth using Immich username plus Immich API key.
+- Immich-admin-gated admin API and React admin UI at `/admin`.
 - Per-request Immich API access using the authenticated user's key.
-- Virtual root with `Albums/`, `Timeline/`, `Favorites/`, and `.well-known/`.
+- Virtual root with `Albums/`, `Timeline/`, `Favorites/`, `Views/`, and `.well-known/`.
+- Admin-defined saved views exposed as read-only folders under `Views/`.
 - Album browsing with date bucketing for large albums.
 - Timeline and favorites browsing grouped by year, month, day, and hour when needed.
 - Original asset streaming with Range support and a bounded disk-backed range cache.
@@ -51,6 +54,9 @@ storage directory, touching its database, or bypassing Immich permissions.
   Favorites/
     README.txt
     YYYY/
+  Views/
+    README.txt
+    <saved view>/
   .well-known/
     immich-bridge.json
 ```
@@ -92,6 +98,14 @@ The admin health endpoint is available at:
 http://localhost:8080/health
 ```
 
+The admin UI is available at:
+
+```text
+http://localhost:8080/admin
+```
+
+Admin login uses an Immich API key and only succeeds for Immich admin users.
+
 ## Configuration
 
 Important environment variables:
@@ -101,6 +115,8 @@ Important environment variables:
 | `IMMICH_URL` | required | Immich API base URL, including `/api` |
 | `WEBDAV_PORT` | `8081` | WebDAV listener port |
 | `ADMIN_PORT` | `8080` | Admin/API listener port |
+| `DATABASE_URL` | `sqlite:////var/lib/immich-bridge/immich-bridge.db` | Durable bridge config database |
+| `ADMIN_SESSION_TTL_SECONDS` | `43200` | Admin UI/API session lifetime |
 | `REDIS_HOST` | `redis` in Compose | Redis for auth cache and DAV locks |
 | `IMMICH_BRIDGE_METRICS` | `false` | Verbose DAV/range/upstream metrics |
 | `ALBUM_FOLDER_SPLIT_THRESHOLD` | `200` | Split large albums into date buckets |
@@ -116,6 +132,8 @@ See `.env.example` for the full list.
 
 ```bash
 uv sync
+npm install --prefix frontend
+npm run build --prefix frontend
 make test
 make lint
 make typecheck
@@ -124,6 +142,10 @@ docker compose up --build
 
 The test suite is intentionally focused on DAV semantics, Immich API boundaries,
 cache behavior, auth behavior, and safety around destructive operations.
+
+Admin APIs live under `/api/admin/*`; the UI calls only those APIs. Saved views are
+stored in SQLite on the long-lived `configdata` Compose volume and rendered into DAV
+as `/Views/<name>/`.
 
 ## Write Semantics
 

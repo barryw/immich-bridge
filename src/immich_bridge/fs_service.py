@@ -54,6 +54,51 @@ class ImmichFilesystem:
             return tuple(self._freeze(item) for item in value)
         return value
 
+    def _view_search_filters(self, filters: dict[str, Any]) -> dict[str, Any]:
+        """Return ImmichClient.search_assets kwargs for a saved view."""
+        allowed = {
+            "album_ids",
+            "person_ids",
+            "tag_ids",
+            "is_favorite",
+            "media_type",
+            "taken_after",
+            "taken_before",
+            "rating",
+            "original_file_name",
+            "ocr",
+            "city",
+            "country",
+        }
+        search_filters: dict[str, Any] = {}
+        for key in allowed:
+            value = filters.get(key)
+            if value is None or value == "" or value == []:
+                continue
+            search_filters[key] = value
+        return search_filters
+
+    def _with_date_bounds(
+        self,
+        filters: dict[str, Any],
+        *,
+        taken_after: str,
+        taken_before: str,
+    ) -> dict[str, Any]:
+        """Return filters narrowed by an additional date interval."""
+        narrowed = dict(filters)
+        existing_after = narrowed.get("taken_after")
+        existing_before = narrowed.get("taken_before")
+        if isinstance(existing_after, str) and existing_after > taken_after:
+            narrowed["taken_after"] = existing_after
+        else:
+            narrowed["taken_after"] = taken_after
+        if isinstance(existing_before, str) and existing_before < taken_before:
+            narrowed["taken_before"] = existing_before
+        else:
+            narrowed["taken_before"] = taken_before
+        return narrowed
+
     def albums(self) -> list[AlbumEntry]:
         """Return user-visible album entries."""
         return self._memoized(
@@ -256,6 +301,210 @@ class ImmichFilesystem:
             return [day.isoformat() for day in days]
 
         return []
+
+    def view_date_range_has_assets(
+        self,
+        filters: dict[str, Any],
+        date_range: DateRange,
+    ) -> bool:
+        """Return whether a saved view has assets in a date range."""
+        search_filters = self._view_search_filters(filters)
+        return self._memoized(
+            ("view-date-range-has-assets", self._freeze(search_filters), date_range),
+            lambda: bool(
+                self._client.search_assets(
+                    page=1,
+                    size=1,
+                    **self._with_date_bounds(
+                        search_filters,
+                        taken_after=iso_boundary(date_range.start),
+                        taken_before=iso_boundary(date_range.end),
+                    ),
+                    with_exif=False,
+                ).items
+            ),
+        )
+
+    def _view_date_bounds(self, filters: dict[str, Any]) -> tuple[date, date] | None:
+        search_filters = self._view_search_filters(filters)
+        return self._memoized(
+            ("view-date-bounds", self._freeze(search_filters)),
+            lambda: self._load_view_date_bounds(search_filters),
+        )
+
+    def _load_view_date_bounds(self, filters: dict[str, Any]) -> tuple[date, date] | None:
+        oldest_page = self._client.search_assets(
+            page=1,
+            size=1,
+            order="asc",
+            **filters,
+            with_exif=False,
+        )
+        newest_page = self._client.search_assets(
+            page=1,
+            size=1,
+            order="desc",
+            **filters,
+            with_exif=False,
+        )
+        if not oldest_page.items or not newest_page.items:
+            return None
+        return (
+            asset_datetime(oldest_page.items[0]).date(),
+            asset_datetime(newest_page.items[0]).date(),
+        )
+
+    def list_view_date_buckets(
+        self,
+        filters: dict[str, Any],
+        date_range: DateRange | None,
+        *,
+        level: str,
+    ) -> list[str]:
+        """List non-empty year, month, or day bucket names for a saved view."""
+        bounds = self._view_date_bounds(filters)
+        if bounds is None:
+            return []
+        oldest, newest = bounds
+
+        if level == "year":
+            buckets: list[str] = []
+            for year in range(newest.year, oldest.year - 1, -1):
+                candidate = DateRange(date(year, 1, 1), date(year + 1, 1, 1))
+                if self.view_date_range_has_assets(filters, candidate):
+                    buckets.append(str(year))
+            return buckets
+
+        if level == "month" and date_range is not None:
+            buckets = []
+            for month in range(12, 0, -1):
+                start = date(date_range.start.year, month, 1)
+                if start < date_range.start or start >= date_range.end:
+                    continue
+                end_year, end_month = (
+                    (date_range.start.year + 1, 1)
+                    if month == 12
+                    else (date_range.start.year, month + 1)
+                )
+                candidate = DateRange(start, date(end_year, end_month, 1))
+                if self.view_date_range_has_assets(filters, candidate):
+                    buckets.append(f"{start.year:04d}-{start.month:02d}")
+            return buckets
+
+        if level == "day" and date_range is not None:
+            assets = self.search_all_assets(
+                **self._with_date_bounds(
+                    self._view_search_filters(filters),
+                    taken_after=iso_boundary(date_range.start),
+                    taken_before=iso_boundary(date_range.end),
+                ),
+                order="desc",
+                with_exif=False,
+            )
+            days = sorted({asset_datetime(asset).date() for asset in assets}, reverse=True)
+            return [day.isoformat() for day in days]
+
+        return []
+
+    def list_view_assets(self, filters: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        """List all named assets for a flat saved view."""
+        assets = self.search_all_assets(
+            **self._view_search_filters(filters),
+            order="asc",
+            with_exif=True,
+        )
+        return asset_entries(assets)
+
+    def resolve_view_asset(self, filters: dict[str, Any], name: str) -> dict[str, Any] | None:
+        """Resolve one flat saved view asset by display filename."""
+        return self.list_view_assets(filters).get(name)
+
+    def list_view_date_assets(
+        self,
+        filters: dict[str, Any],
+        date_range: DateRange,
+    ) -> dict[str, dict[str, Any]]:
+        """List named saved-view assets inside a concrete date bucket."""
+        assets = self.search_all_assets(
+            **self._with_date_bounds(
+                self._view_search_filters(filters),
+                taken_after=iso_boundary(date_range.start),
+                taken_before=iso_boundary(date_range.end),
+            ),
+            order="asc",
+            with_exif=True,
+        )
+        return asset_entries(assets)
+
+    def resolve_view_date_asset(
+        self,
+        filters: dict[str, Any],
+        date_range: DateRange,
+        name: str,
+    ) -> dict[str, Any] | None:
+        """Resolve a saved-view asset inside a date bucket."""
+        return self.list_view_date_assets(filters, date_range).get(name)
+
+    def should_split_view_day(self, filters: dict[str, Any], date_range: DateRange) -> bool:
+        """Return whether a saved-view day folder should expose hour buckets."""
+        return self._memoized(
+            ("should-split-view-day", self._freeze(filters), date_range),
+            lambda: self._load_should_split_view_day(filters, date_range),
+        )
+
+    def _load_should_split_view_day(self, filters: dict[str, Any], date_range: DateRange) -> bool:
+        page = self._client.search_assets(
+            page=1,
+            size=1,
+            **self._with_date_bounds(
+                self._view_search_filters(filters),
+                taken_after=iso_boundary(date_range.start),
+                taken_before=iso_boundary(date_range.end),
+            ),
+            with_exif=False,
+        )
+        total = page.total or len(page.items)
+        return total > self._day_folder_split_threshold
+
+    def list_view_hour_buckets(self, filters: dict[str, Any], date_range: DateRange) -> list[str]:
+        """List non-empty hour buckets inside a large saved-view day folder."""
+        assets = self.search_all_assets(
+            **self._with_date_bounds(
+                self._view_search_filters(filters),
+                taken_after=iso_boundary(date_range.start),
+                taken_before=iso_boundary(date_range.end),
+            ),
+            order="asc",
+            with_exif=False,
+        )
+        hours = sorted({asset_datetime(asset).hour for asset in assets})
+        return [f"{hour:02d}" for hour in hours]
+
+    def list_view_hour_assets(
+        self,
+        filters: dict[str, Any],
+        hour_range: HourRange,
+    ) -> dict[str, dict[str, Any]]:
+        """List saved-view assets inside an hour bucket."""
+        assets = self.search_all_assets(
+            **self._with_date_bounds(
+                self._view_search_filters(filters),
+                taken_after=hour_range.start_iso,
+                taken_before=hour_range.end_iso,
+            ),
+            order="asc",
+            with_exif=True,
+        )
+        return asset_entries(assets)
+
+    def resolve_view_hour_asset(
+        self,
+        filters: dict[str, Any],
+        hour_range: HourRange,
+        name: str,
+    ) -> dict[str, Any] | None:
+        """Resolve one saved-view asset inside an hour bucket."""
+        return self.list_view_hour_assets(filters, hour_range).get(name)
 
     def list_album_date_buckets(
         self,

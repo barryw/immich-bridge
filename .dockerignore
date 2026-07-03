@@ -9,3 +9,5 @@ __pycache__/
 .env.*
 !.env.example
 .immich-port-forward.pid
+frontend/dist/
+frontend/node_modules/

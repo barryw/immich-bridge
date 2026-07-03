@@ -32,7 +32,7 @@ def test_basic_auth_stores_identity_in_environ() -> None:
     client = MagicMock()
     client.get.side_effect = [user_response, key_response]
 
-    with patch("immich_bridge.webdav_auth.httpx.Client") as mock_client_cls:
+    with patch("immich_bridge.immich_auth.httpx.Client") as mock_client_cls:
         mock_client_cls.return_value.__enter__.return_value = client
         environ: dict[str, object] = {}
 
@@ -55,7 +55,7 @@ def test_basic_auth_returns_false_on_invalid_key() -> None:
     client = MagicMock()
     client.get.return_value = user_response
 
-    with patch("immich_bridge.webdav_auth.httpx.Client") as mock_client_cls:
+    with patch("immich_bridge.immich_auth.httpx.Client") as mock_client_cls:
         mock_client_cls.return_value.__enter__.return_value = client
         result = auth.basic_auth_user("realm", "barry", "bad-key", {})
 
@@ -81,7 +81,7 @@ def test_basic_auth_uses_shared_cache_backend() -> None:
     client = MagicMock()
     client.get.side_effect = [user_response, key_response]
 
-    with patch("immich_bridge.webdav_auth.httpx.Client") as mock_client_cls:
+    with patch("immich_bridge.immich_auth.httpx.Client") as mock_client_cls:
         mock_client_cls.return_value.__enter__.return_value = client
 
         first_result = first_auth.basic_auth_user("realm", "barry", "api-key", {})
@@ -113,7 +113,7 @@ def test_basic_auth_rate_limits_failed_attempts() -> None:
     client = MagicMock()
     client.get.return_value = user_response
 
-    with patch("immich_bridge.webdav_auth.httpx.Client") as mock_client_cls:
+    with patch("immich_bridge.immich_auth.httpx.Client") as mock_client_cls:
         mock_client_cls.return_value.__enter__.return_value = client
         first_result = auth.basic_auth_user(
             "realm",

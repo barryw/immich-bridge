@@ -13,6 +13,14 @@ class Settings(BaseSettings):
 
     admin_port: int = Field(default=8080, description="Admin API port")
     webdav_port: int = Field(default=8081, description="WebDAV server port")
+    database_url: str = Field(
+        default="sqlite:////var/lib/immich-bridge/immich-bridge.db",
+        description="Durable SQLite database URL for bridge-owned configuration",
+    )
+    admin_session_ttl_seconds: int = Field(
+        default=43_200,
+        description="Admin UI/API session TTL",
+    )
 
     redis_host: str | None = Field(default=None, description="Redis host for cache and locks")
     redis_port: int = Field(default=6379, description="Redis port")

@@ -158,11 +158,11 @@ Recommended initial stack:
 | --- | --- | --- |
 | Language | Python 3.12+ | Reuses lessons from `paperless-webdav`; mature DAV libraries |
 | Admin service | FastAPI | Existing pattern, async HTTP, simple health endpoints |
-| Admin UI | Jinja2 + HTMX | Enough UI without SPA complexity |
+| Admin UI | React + TypeScript + Vite | API-first, reactive config UI served from the admin port |
 | WebDAV | WsgiDAV + Cheroot | Mature provider model and known client workarounds |
 | HTTP client | httpx | Async streaming, connection pooling, timeout control |
-| Database | SQLite default, PostgreSQL optional | Easy single-user start, production-ready option |
-| ORM/migrations | SQLAlchemy + Alembic | Same family as `paperless-webdav` |
+| Database | SQLite default, PostgreSQL optional later | Durable bridge-owned configuration |
+| ORM/migrations | stdlib `sqlite3` initially | Keeps the first config store small |
 | Encryption | cryptography AES-GCM | Deferred until stored API keys or DAV app passwords exist |
 | Locking | Redis when configured; disabled otherwise | Avoids unsafe per-process DAV locks |
 | Logging | structlog JSON | Useful for troubleshooting DAV clients |
@@ -180,6 +180,13 @@ V1 supports one authentication contract: WebDAV Basic Auth with an Immich userna
 - Do not store API keys at rest in V1. Keep the active request's key in request context only.
 
 This keeps OIDC out of the WebDAV path. Even if Immich itself uses OIDC, users can create scoped Immich API keys in Immich and paste those into Finder, rclone, Cyberduck, or other DAV clients.
+
+The admin API/UI also uses Immich as the source of truth:
+
+- Admin login validates an Immich API key.
+- The authenticated Immich user must have `isAdmin=true`.
+- The bridge issues an admin session cookie for the UI and accepts bearer session tokens for automation.
+- Local SQLite stores bridge configuration and sessions, not local users or passwords.
 
 Deferred authentication modes:
 
@@ -210,6 +217,7 @@ Rules:
   Albums/
   Timeline/
   Favorites/
+  Views/
   .well-known/
 ```
 
@@ -609,59 +617,64 @@ Avoid automatic "on dismount" behavior. DAV clients do not give a reliable dismo
 
 Initial pages:
 
-- Basic status page
 - Dashboard
-- Shares list
-- Create/edit share
-- Auth diagnostics
-- Cache diagnostics
-- Recent DAV client activity
-- Write policy explanation
-- Health/readiness status
+- Saved views
+- Mount layout
+- Write policy
+- Diagnostics
+- Realtime health/activity stream
 
-Share configuration:
+Saved view configuration:
 
 | Field | Description |
 | --- | --- |
 | Name | DAV path segment |
-| Source | Library, album, tag, person, favorites, metadata search, edit session |
+| Source | Metadata search |
 | Filters | Album IDs, tag IDs, person IDs, date range, favorites, asset type |
-| Layout | Flat, date folders, album folders, original filenames |
-| Filename mode | `date-original-id`, `original`, `stable` |
-| Visibility | Include archived, hidden, partner assets, trash |
-| Variants | Original, edited, thumbnail |
-| Write policy | Read-only, upload-only, album membership, destructive |
-| Expiration | Optional hard cutoff |
-| Allowed users | Immich user IDs or usernames; public/service-token shares are deferred |
+| Layout | Flat or date buckets |
+| Enabled | Whether the view appears under `/Views` |
+
+The UI calls only `/api/admin/*` JSON APIs. It is a client of the admin API, not a second configuration path.
 
 ## Local Database
 
-SQLite should be enough for a single-user container. PostgreSQL should be supported for multi-user or replicated deployments.
+SQLite lives on the long-lived `configdata` volume at `/var/lib/immich-bridge` in the Compose deployment. PostgreSQL may be supported later for multi-user or replicated deployments.
 
 Core tables:
 
 ```sql
-CREATE TABLE users (
-    id TEXT PRIMARY KEY,
-    display_name TEXT NOT NULL,
-    immich_user_id TEXT,
-    last_seen_at TEXT,
-    created_at TEXT NOT NULL,
+CREATE TABLE settings (
+    key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 
-CREATE TABLE shares (
+CREATE TABLE admin_sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    email TEXT,
+    name TEXT,
+    api_key_name TEXT,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL
+);
+
+CREATE TABLE views (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
-    owner_user_id TEXT REFERENCES users(id),
-    source_kind TEXT NOT NULL,
-    source_config_json TEXT NOT NULL,
-    layout_config_json TEXT NOT NULL,
-    write_policy_json TEXT NOT NULL,
-    expires_at TEXT,
+    description TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    layout TEXT NOT NULL DEFAULT 'date_buckets',
+    filters_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+```
+
+Potential later cache/audit tables:
+
+```sql
 
 CREATE TABLE asset_cache (
     asset_id TEXT PRIMARY KEY,
@@ -711,9 +724,7 @@ Environment variables:
 
 ```text
 IMMICH_URL=https://immich.example.com
-DATABASE_URL=sqlite:////data/immich-bridge.db
-ENCRYPTION_KEY=<base64 32-byte key>
-SECRET_KEY=<session signing key>
+DATABASE_URL=sqlite:////var/lib/immich-bridge/immich-bridge.db
 
 ADMIN_PORT=8080
 WEBDAV_PORT=8081
@@ -723,6 +734,7 @@ ALLOW_ANONYMOUS=false
 AUTH_CACHE_TTL_SECONDS=300
 AUTH_FAILURE_LIMIT=10
 AUTH_FAILURE_WINDOW_SECONDS=300
+ADMIN_SESSION_TTL_SECONDS=43200
 
 ALBUM_CACHE_TTL_SECONDS=60
 SEARCH_CACHE_TTL_SECONDS=30

@@ -73,6 +73,7 @@ def run_servers() -> None:
         blob_cache_max_range_bytes=settings.blob_cache_max_range_bytes,
         blob_cache_ttl_seconds=settings.blob_cache_ttl_seconds,
         upload_receipt_ttl_seconds=settings.upload_receipt_ttl_seconds,
+        database_url=settings.database_url,
     )
 
     webdav_thread = threading.Thread(target=webdav_server.start, daemon=True)

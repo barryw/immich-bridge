@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 from wsgidav.dav_error import HTTP_BAD_GATEWAY, HTTP_FORBIDDEN, DAVError
 
+from immich_bridge.admin_store import get_admin_store
 from immich_bridge.immich_client import ImmichApiError, SearchPage
 from immich_bridge.webdav_provider import (
     AlbumDateBucketCollection,
@@ -45,6 +46,7 @@ class FakeImmichClient:
         self.uploads: list[dict[str, Any]] = []
         self.album_adds: list[tuple[str, str]] = []
         self.album_removes: list[tuple[str, str]] = []
+        self.search_calls: list[dict[str, Any]] = []
 
     def list_albums(self) -> list[dict[str, Any]]:
         """Return a visible album."""
@@ -59,6 +61,7 @@ class FakeImmichClient:
 
     def search_assets(self, **kwargs: Any) -> SearchPage:
         """Return matching assets for the provider query."""
+        self.search_calls.append(kwargs)
         taken_after = kwargs.get("taken_after")
         taken_before = kwargs.get("taken_before")
         if taken_after and taken_before:
@@ -155,6 +158,7 @@ def test_root_lists_v1_collections() -> None:
         "Albums",
         "Timeline",
         "Favorites",
+        "Views",
         ".well-known",
     ]
 
@@ -260,11 +264,49 @@ def test_virtual_readmes_are_only_files_at_top_level_directories() -> None:
     assert favorites is not None
     assert favorites.get_member_names() == [README_FILENAME]
     assert isinstance(favorites.get_member(README_FILENAME), ReadmeResource)
+    views_readme = provider.get_resource_inst(f"/Views/{README_FILENAME}", auth_environ())
+    assert isinstance(views_readme, ReadmeResource)
 
     assert provider.get_resource_inst("/IMG_0001.jpg", auth_environ()) is None
     assert provider.get_resource_inst("/Albums/IMG_0001.jpg", auth_environ()) is None
     assert provider.get_resource_inst("/Timeline/IMG_0001.jpg", auth_environ()) is None
     assert provider.get_resource_inst("/Favorites/IMG_0001.jpg", auth_environ()) is None
+
+
+def test_saved_views_are_exposed_as_read_only_dav_folders(tmp_path: Path) -> None:
+    """Admin-defined views should appear under /Views and query Immich by filters."""
+    database_url = f"sqlite:///{tmp_path / 'bridge.db'}"
+    get_admin_store.cache_clear()
+    store = get_admin_store(database_url)
+    store.upsert_view(
+        {
+            "id": "view-1",
+            "name": "Kids",
+            "description": "",
+            "enabled": True,
+            "layout": "date_buckets",
+            "filters": {"tag_ids": ["tag-1"], "person_ids": ["person-1"]},
+        }
+    )
+    client = FakeImmichClient()
+    provider = ImmichProvider("http://immich.test/api", database_url=database_url)
+    provider._client = lambda environ: client  # type: ignore[method-assign]
+
+    views = provider.get_resource_inst("/Views", auth_environ())
+    assert views is not None
+    assert views.get_member_names() == [README_FILENAME, "Kids"]
+
+    view = views.get_member("Kids")
+    assert view is not None
+    assert view.get_member_names() == ["2026"]
+
+    asset = provider.get_resource_inst(
+        "/Views/Kids/2026/2026-06/2026-06-28/2026-06-28 16.38.37 IMG-0001--c1ada054.heic",
+        auth_environ(),
+    )
+    assert asset is not None
+    assert any(call.get("tag_ids") == ["tag-1"] for call in client.search_calls)
+    assert any(call.get("person_ids") == ["person-1"] for call in client.search_calls)
 
 
 def test_root_rejects_non_media_collection_delete_and_move_operations() -> None:
@@ -452,6 +494,50 @@ def test_album_delete_removes_membership_without_deleting_asset() -> None:
     assert asset is not None
     assert asset.handle_delete() is True
     assert client.album_removes == [("album-1", ASSET["id"])]
+
+
+def test_write_policy_toggles_disable_dav_writes(tmp_path: Path) -> None:
+    """Persisted write policy should gate DAV write operations."""
+    database_url = f"sqlite:///{tmp_path / 'bridge.db'}"
+    get_admin_store.cache_clear()
+    store = get_admin_store(database_url)
+    store.set_setting(
+        "write_policy",
+        {
+            "rootUploads": False,
+            "albumUploads": False,
+            "albumCreate": False,
+            "albumMembershipDelete": False,
+            "permanentDelete": False,
+            "moveCopy": False,
+            "overwrite": False,
+        },
+    )
+    provider = provider_with_client(FakeImmichClient())
+    provider._database_url = database_url
+
+    root = provider.get_resource_inst("/", auth_environ())
+    albums = provider.get_resource_inst("/Albums", auth_environ())
+    album = provider.get_resource_inst("/Albums/Vacation-2026", auth_environ())
+    asset = provider.get_resource_inst(
+        "/Albums/Vacation-2026/2026-06-28 16.38.37 IMG-0001--c1ada054.heic",
+        auth_environ(),
+    )
+
+    assert isinstance(root, RootResource)
+    assert albums is not None
+    assert album is not None
+    assert asset is not None
+
+    for operation in (
+        lambda: root.create_empty_resource("IMG_0001.jpg"),
+        lambda: albums.create_collection("Blocked"),
+        lambda: album.create_empty_resource("IMG_0002.jpg"),
+        lambda: asset.handle_delete(),
+    ):
+        with pytest.raises(DAVError) as exc_info:
+            operation()
+        assert exc_info.value.value == HTTP_FORBIDDEN
 
 
 def test_timeline_delete_remains_forbidden() -> None:

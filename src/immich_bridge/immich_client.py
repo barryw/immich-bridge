@@ -600,9 +600,17 @@ class ImmichClient:
         size: int = 100,
         order: str | None = None,
         album_ids: list[str] | None = None,
+        person_ids: list[str] | None = None,
+        tag_ids: list[str] | None = None,
         is_favorite: bool | None = None,
+        media_type: str | None = None,
         taken_after: str | None = None,
         taken_before: str | None = None,
+        rating: int | None = None,
+        original_file_name: str | None = None,
+        ocr: str | None = None,
+        city: str | None = None,
+        country: str | None = None,
         with_exif: bool = True,
     ) -> SearchPage:
         """Search assets by Immich metadata filters."""
@@ -615,12 +623,28 @@ class ImmichClient:
             body["order"] = order
         if album_ids:
             body["albumIds"] = album_ids
+        if person_ids:
+            body["personIds"] = person_ids
+        if tag_ids:
+            body["tagIds"] = tag_ids
         if is_favorite is not None:
             body["isFavorite"] = is_favorite
+        if media_type:
+            body["type"] = media_type
         if taken_after:
             body["takenAfter"] = taken_after
         if taken_before:
             body["takenBefore"] = taken_before
+        if rating is not None:
+            body["rating"] = rating
+        if original_file_name:
+            body["originalFileName"] = original_file_name
+        if ocr:
+            body["ocr"] = ocr
+        if city:
+            body["city"] = city
+        if country:
+            body["country"] = country
 
         key = self._cache_key("search", body)
 

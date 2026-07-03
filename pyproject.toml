@@ -31,6 +31,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/immich_bridge"]
+artifacts = ["src/immich_bridge/admin_static/**"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

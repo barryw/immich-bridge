@@ -1,26 +1,16 @@
 """HTTP Basic authentication for WebDAV using Immich API keys."""
 
 import hashlib
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from typing import Any
 
-import httpx
 from wsgidav.dc.base_dc import BaseDomainController  # type: ignore[import-untyped]
 
 from immich_bridge.cache import get_cache
+from immich_bridge.immich_auth import ImmichIdentity, validate_immich_api_key
 from immich_bridge.logging import get_logger
 
 logger = get_logger(__name__)
-
-
-@dataclass(frozen=True)
-class ImmichIdentity:
-    """Validated Immich identity derived from an API key."""
-
-    user_id: str
-    email: str | None
-    name: str | None
-    api_key_name: str | None = None
 
 
 class ImmichBasicAuthenticator(BaseDomainController):  # type: ignore[misc]
@@ -79,37 +69,10 @@ class ImmichBasicAuthenticator(BaseDomainController):  # type: ignore[misc]
 
     def _validate_api_key(self, api_key: str) -> ImmichIdentity | None:
         """Validate an Immich API key and return identity metadata."""
-        headers = {"x-api-key": api_key}
-
-        try:
-            with httpx.Client(timeout=self._timeout_seconds) as client:
-                user_response = client.get(f"{self._immich_url}/users/me", headers=headers)
-                if user_response.status_code != 200:
-                    logger.info("immich_auth_failed", status=user_response.status_code)
-                    return None
-
-                user_data = user_response.json()
-
-                api_key_name = None
-                key_response = client.get(f"{self._immich_url}/api-keys/me", headers=headers)
-                if key_response.status_code == 200:
-                    key_data = key_response.json()
-                    api_key_name = key_data.get("name")
-
-        except (httpx.RequestError, ValueError) as e:
-            logger.warning("immich_auth_error", error=str(e))
-            return None
-
-        user_id = user_data.get("id")
-        if not user_id:
-            logger.warning("immich_auth_missing_user_id")
-            return None
-
-        return ImmichIdentity(
-            user_id=user_id,
-            email=user_data.get("email"),
-            name=user_data.get("name"),
-            api_key_name=api_key_name,
+        return validate_immich_api_key(
+            self._immich_url,
+            api_key,
+            timeout_seconds=self._timeout_seconds,
         )
 
     def _get_cached_identity(self, api_key: str) -> ImmichIdentity | None:
@@ -128,6 +91,7 @@ class ImmichBasicAuthenticator(BaseDomainController):  # type: ignore[misc]
             api_key_name=cached.get("api_key_name")
             if isinstance(cached.get("api_key_name"), str)
             else None,
+            is_admin=bool(cached.get("is_admin")),
         )
         logger.debug("webdav_auth_cache_hit", user_id=identity.user_id)
         return identity

@@ -9,7 +9,7 @@ from datetime import date, datetime, time, timezone
 from pathlib import PurePosixPath
 from typing import Any
 
-ROOT_COLLECTIONS = ("Albums", "Timeline", "Favorites", ".well-known")
+ROOT_COLLECTIONS = ("Albums", "Timeline", "Favorites", "Views", ".well-known")
 WINDOWS_UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 WHITESPACE = re.compile(r"\s+")
 

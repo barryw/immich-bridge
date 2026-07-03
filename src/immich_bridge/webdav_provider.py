@@ -22,6 +22,7 @@ from wsgidav.dav_error import (  # type: ignore[import-untyped]
 )
 from wsgidav.dav_provider import DAVCollection, DAVNonCollection, DAVProvider  # type: ignore[import-untyped]
 
+from immich_bridge.admin_store import DEFAULT_MOUNT_SETTINGS, AdminStore, get_admin_store
 from immich_bridge.blob_cache import BlobCache
 from immich_bridge.cache import get_cache
 from immich_bridge.fs_model import (
@@ -32,6 +33,7 @@ from immich_bridge.fs_model import (
     SearchTruncatedError,
     date_range_from_parts,
     hour_range_from_parts,
+    safe_segment,
     timestamp,
 )
 from immich_bridge.fs_service import ImmichFilesystem
@@ -187,6 +189,7 @@ class ImmichProvider(DAVProvider):  # type: ignore[misc]
         blob_cache_max_range_bytes: int = 8_388_608,
         blob_cache_ttl_seconds: int = 86_400,
         upload_receipt_ttl_seconds: int = 1800,
+        database_url: str = "sqlite:////tmp/immich-bridge/immich-bridge.db",
     ) -> None:
         """Initialize the provider."""
         super().__init__()
@@ -202,6 +205,7 @@ class ImmichProvider(DAVProvider):  # type: ignore[misc]
         self._webdav_locks_enabled = webdav_locks_enabled
         self._metrics_enabled = metrics_enabled
         self._upload_receipt_ttl_seconds = upload_receipt_ttl_seconds
+        self._database_url = database_url
         self._blob_cache = (
             BlobCache(
                 blob_cache_dir,
@@ -235,6 +239,11 @@ class ImmichProvider(DAVProvider):  # type: ignore[misc]
             return RootResource(normalized, environ)
 
         first = parts[0]
+        if first in {"Albums", "Timeline", "Favorites", "Views"} and (
+            first not in self.root_collection_names()
+        ):
+            return None
+
         if first == "Albums":
             return self._resolve_albums(
                 normalized, parts, environ
@@ -250,6 +259,9 @@ class ImmichProvider(DAVProvider):  # type: ignore[misc]
                 environ,
                 is_favorite=first == "Favorites",
             ) or self._upload_receipt_resource(normalized, environ)
+
+        if first == "Views":
+            return self._resolve_saved_view(normalized, parts, environ)
 
         if parts == [".well-known"]:
             return WellKnownCollection(normalized, environ)
@@ -275,6 +287,7 @@ class ImmichProvider(DAVProvider):  # type: ignore[misc]
                 "Albums",
                 "Timeline",
                 "Favorites",
+                "Views",
             }
         )
 
@@ -290,6 +303,7 @@ class ImmichProvider(DAVProvider):  # type: ignore[misc]
                 "- Albums contains Immich albums.\n"
                 "- Timeline contains media grouped by capture date.\n"
                 "- Favorites contains favorite media grouped by capture date.\n"
+                "- Views contains admin-defined saved searches.\n"
                 "\n"
                 "Media uploaded at the root is imported into Immich and appears through "
                 "Timeline after Immich indexes it; it is not kept as a root file.\n"
@@ -315,6 +329,16 @@ class ImmichProvider(DAVProvider):  # type: ignore[misc]
                 "\n"
                 "Use root or album folders for uploads. Timeline contents are organized "
                 "by Immich capture time and metadata.\n"
+            )
+        if collection_name == "Views":
+            return (
+                "Immich Bridge Views\n"
+                "\n"
+                "This folder lists admin-defined saved searches as virtual folders. The "
+                "only regular file shown here is this README.\n"
+                "\n"
+                "Configure views in the Immich Bridge admin UI. View folders are read-only "
+                "projections of Immich metadata search results.\n"
             )
         return (
             "Immich Bridge Favorites\n"
@@ -428,10 +452,86 @@ class ImmichProvider(DAVProvider):  # type: ignore[misc]
             self._client(environ),
             search_page_size=self._search_page_size,
             search_max_pages=self._search_max_pages,
-            day_folder_split_threshold=self._day_folder_split_threshold,
+            day_folder_split_threshold=self._configured_day_folder_split_threshold(),
         )
         environ["immich_bridge.filesystem"] = filesystem
         return filesystem
+
+    def _admin_store(self) -> AdminStore:
+        return get_admin_store(self._database_url)
+
+    def root_collection_names(self) -> list[str]:
+        """Return enabled top-level DAV collections."""
+        mount = self._admin_store().get_setting("mount")
+        names: list[str] = []
+        if mount.get("albumsEnabled", True):
+            names.append("Albums")
+        if mount.get("timelineEnabled", True):
+            names.append("Timeline")
+        if mount.get("favoritesEnabled", True):
+            names.append("Favorites")
+        if mount.get("viewsEnabled", True):
+            names.append("Views")
+        names.append(".well-known")
+        return names
+
+    def mount_settings(self) -> dict[str, Any]:
+        """Return persisted mount settings."""
+        return self._admin_store().get_setting("mount")
+
+    def write_policy(self) -> dict[str, Any]:
+        """Return persisted WebDAV write policy."""
+        return self._admin_store().get_setting("write_policy")
+
+    def write_allowed(self, key: str, *, default: bool) -> bool:
+        """Return whether a named WebDAV write operation is enabled."""
+        value = self.write_policy().get(key)
+        return bool(value) if isinstance(value, bool) else default
+
+    def _configured_album_folder_split_threshold(self) -> int:
+        mount = self.mount_settings()
+        value = mount.get("albumFolderSplitThreshold")
+        if value == DEFAULT_MOUNT_SETTINGS["albumFolderSplitThreshold"]:
+            return self._album_folder_split_threshold
+        if value is None:
+            return self._album_folder_split_threshold
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return self._album_folder_split_threshold
+
+    def _configured_day_folder_split_threshold(self) -> int:
+        mount = self.mount_settings()
+        value = mount.get("dayFolderSplitThreshold")
+        if value == DEFAULT_MOUNT_SETTINGS["dayFolderSplitThreshold"]:
+            return self._day_folder_split_threshold
+        if value is None:
+            return self._day_folder_split_threshold
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return self._day_folder_split_threshold
+
+    def saved_view_entries(self) -> list[dict[str, Any]]:
+        """Return enabled saved views with DAV-safe display names."""
+        views = self._admin_store().list_views(enabled_only=True)
+        entries: list[dict[str, Any]] = []
+        used: dict[str, int] = {}
+        for view in views:
+            base = safe_segment(view.get("name"), fallback="View")
+            normalized = base.casefold()
+            count = used.get(normalized, 0)
+            used[normalized] = count + 1
+            dav_name = base if count == 0 else f"{base}--{count + 1}"
+            entries.append({**view, "davName": dav_name})
+        return sorted(entries, key=lambda view: str(view["davName"]).casefold())
+
+    def saved_view_by_name(self, name: str) -> dict[str, Any] | None:
+        """Resolve a saved view by DAV path segment."""
+        for view in self.saved_view_entries():
+            if view["davName"] == name:
+                return view
+        return None
 
     def _run_fs(self, operation: Any) -> Any:
         try:
@@ -644,6 +744,80 @@ class ImmichProvider(DAVProvider):  # type: ignore[misc]
 
         return None
 
+    def _resolve_saved_view(
+        self,
+        path: str,
+        parts: list[str],
+        environ: dict[str, Any],
+    ) -> Any | None:
+        if len(parts) == 1:
+            return ViewsRootCollection(path, environ)
+
+        view = self.saved_view_by_name(parts[1])
+        if view is None:
+            return None
+
+        raw_filters = view.get("filters")
+        filters: dict[str, Any] = raw_filters if isinstance(raw_filters, dict) else {}
+        layout = str(view.get("layout") or "date_buckets")
+
+        if len(parts) == 2:
+            return SavedViewCollection(path, environ, view)
+
+        if layout == "flat":
+            if len(parts) == 3:
+                asset = self.resolve_saved_view_asset(environ, filters, parts[2])
+                if asset is None:
+                    return None
+                return AssetResource(path, environ, asset)
+            return None
+
+        date_parts = ["View", *parts[2:]]
+        date_range = self._date_range_from_parts(
+            date_parts[:4] if len(date_parts) >= 5 else date_parts
+        )
+        if date_range is None:
+            return None
+
+        if not self.saved_view_date_range_has_assets(environ, filters, date_range):
+            return None
+
+        if len(parts) in {3, 4, 5}:
+            return SavedViewDateBucketCollection(path, environ, view, date_range)
+
+        if len(parts) == 6:
+            hour_range = self._hour_range_from_environ(environ, date_parts)
+            if hour_range is not None and self.should_split_saved_view_day(
+                environ,
+                filters,
+                date_range,
+            ):
+                return SavedViewHourBucketCollection(path, environ, view, hour_range)
+
+            asset = self.resolve_saved_view_date_asset(
+                environ,
+                filters,
+                date_range,
+                parts[5],
+            )
+            if asset is None:
+                return None
+            return AssetResource(path, environ, asset)
+
+        if len(parts) == 7:
+            day_range = self._date_range_from_parts(date_parts[:4])
+            hour_range = self._hour_range_from_environ(environ, date_parts[:5])
+            if day_range is None or hour_range is None:
+                return None
+            if not self.should_split_saved_view_day(environ, filters, day_range):
+                return None
+            asset = self.resolve_saved_view_hour_asset(environ, filters, hour_range, parts[6])
+            if asset is None:
+                return None
+            return AssetResource(path, environ, asset)
+
+        return None
+
     def _date_range_from_parts(self, parts: list[str]) -> DateRange | None:
         return date_range_from_parts(parts)
 
@@ -708,13 +882,137 @@ class ImmichProvider(DAVProvider):  # type: ignore[misc]
             )
         )
 
+    def saved_view_date_range_has_assets(
+        self,
+        environ: dict[str, Any],
+        filters: dict[str, Any],
+        date_range: DateRange,
+    ) -> bool:
+        """Return whether a saved view has assets in a date range."""
+        return self._run_fs(
+            lambda: self._filesystem(environ).view_date_range_has_assets(
+                filters,
+                date_range,
+            )
+        )
+
+    def list_saved_view_date_buckets(
+        self,
+        environ: dict[str, Any],
+        filters: dict[str, Any],
+        date_range: DateRange | None,
+        *,
+        level: str,
+    ) -> list[str]:
+        """List non-empty saved-view date bucket names."""
+        return self._run_fs(
+            lambda: self._filesystem(environ).list_view_date_buckets(
+                filters,
+                date_range,
+                level=level,
+            )
+        )
+
+    def list_saved_view_assets(
+        self,
+        environ: dict[str, Any],
+        filters: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        """List named assets in a flat saved view."""
+        return self._run_fs(lambda: self._filesystem(environ).list_view_assets(filters))
+
+    def resolve_saved_view_asset(
+        self,
+        environ: dict[str, Any],
+        filters: dict[str, Any],
+        name: str,
+    ) -> dict[str, Any] | None:
+        """Resolve a flat saved-view asset."""
+        return self._run_fs(lambda: self._filesystem(environ).resolve_view_asset(filters, name))
+
+    def list_saved_view_date_assets(
+        self,
+        environ: dict[str, Any],
+        filters: dict[str, Any],
+        date_range: DateRange,
+    ) -> dict[str, dict[str, Any]]:
+        """List named saved-view assets inside a date bucket."""
+        return self._run_fs(
+            lambda: self._filesystem(environ).list_view_date_assets(filters, date_range)
+        )
+
+    def resolve_saved_view_date_asset(
+        self,
+        environ: dict[str, Any],
+        filters: dict[str, Any],
+        date_range: DateRange,
+        name: str,
+    ) -> dict[str, Any] | None:
+        """Resolve a saved-view asset inside a date bucket."""
+        return self._run_fs(
+            lambda: self._filesystem(environ).resolve_view_date_asset(
+                filters,
+                date_range,
+                name,
+            )
+        )
+
+    def should_split_saved_view_day(
+        self,
+        environ: dict[str, Any],
+        filters: dict[str, Any],
+        date_range: DateRange,
+    ) -> bool:
+        """Return whether a saved-view day bucket should expose hours."""
+        return self._run_fs(
+            lambda: self._filesystem(environ).should_split_view_day(filters, date_range)
+        )
+
+    def list_saved_view_hour_buckets(
+        self,
+        environ: dict[str, Any],
+        filters: dict[str, Any],
+        date_range: DateRange,
+    ) -> list[str]:
+        """List non-empty saved-view hour bucket names."""
+        return self._run_fs(
+            lambda: self._filesystem(environ).list_view_hour_buckets(filters, date_range)
+        )
+
+    def list_saved_view_hour_assets(
+        self,
+        environ: dict[str, Any],
+        filters: dict[str, Any],
+        hour_range: HourRange,
+    ) -> dict[str, dict[str, Any]]:
+        """List named saved-view assets inside an hour bucket."""
+        return self._run_fs(
+            lambda: self._filesystem(environ).list_view_hour_assets(filters, hour_range)
+        )
+
+    def resolve_saved_view_hour_asset(
+        self,
+        environ: dict[str, Any],
+        filters: dict[str, Any],
+        hour_range: HourRange,
+        name: str,
+    ) -> dict[str, Any] | None:
+        """Resolve a saved-view asset inside an hour bucket."""
+        return self._run_fs(
+            lambda: self._filesystem(environ).resolve_view_hour_asset(
+                filters,
+                hour_range,
+                name,
+            )
+        )
+
     def should_split_album(self, album: AlbumEntry) -> bool:
         """Return whether an album folder should expose date buckets."""
         try:
             asset_count = int(album.album.get("assetCount") or 0)
         except (TypeError, ValueError):
             return False
-        return asset_count > self._album_folder_split_threshold
+        return asset_count > self._configured_album_folder_split_threshold()
 
     def album_date_range_has_assets(
         self,
@@ -1220,12 +1518,21 @@ class RootResource(ReadOnlyResourceMixin, DAVCollection):  # type: ignore[misc]
         """Treat root PUT as a raw Immich library upload."""
         if is_macos_metadata_file(name):
             return MacOSMetadataResource(f"/{name}", self.environ)
+        provider = self.provider
+        if isinstance(provider, ImmichProvider) and not provider.write_allowed(
+            "rootUploads",
+            default=True,
+        ):
+            raise DAVError(HTTP_FORBIDDEN)
         if not is_supported_media_upload_name(name):
             raise DAVError(HTTP_FORBIDDEN)
         return UploadResource(f"/{name}", self.environ, filename=name)
 
     def get_member_names(self) -> list[str]:
         """Return V1 root collection names."""
+        provider = self.provider
+        if isinstance(provider, ImmichProvider):
+            return [README_FILENAME, *provider.root_collection_names()]
         return [README_FILENAME, *ROOT_COLLECTIONS]
 
     def get_member(self, name: str) -> Any | None:
@@ -1242,6 +1549,8 @@ class RootResource(ReadOnlyResourceMixin, DAVCollection):  # type: ignore[misc]
             return DateRootCollection(
                 f"/{name}", self.environ, name, is_favorite=name == "Favorites"
             )
+        if name == "Views":
+            return ViewsRootCollection(f"/{name}", self.environ)
         if name == ".well-known":
             return WellKnownCollection(f"/{name}", self.environ)
         return None
@@ -1270,6 +1579,8 @@ class AlbumsRootCollection(ReadOnlyResourceMixin, DAVCollection):  # type: ignor
     def create_collection(self, name: str) -> None:
         """Create an Immich album."""
         if name == README_FILENAME or is_macos_metadata_file(name):
+            raise DAVError(HTTP_FORBIDDEN)
+        if not self._immich_provider.write_allowed("albumCreate", default=True):
             raise DAVError(HTTP_FORBIDDEN)
         self._immich_provider.create_album(self.environ, name)
 
@@ -1323,6 +1634,8 @@ class AlbumCollection(ReadOnlyResourceMixin, DAVCollection):  # type: ignore[mis
         """Upload a new asset and add it to this album."""
         if is_macos_metadata_file(name):
             return MacOSMetadataResource(f"{self.path.rstrip('/')}/{name}", self.environ)
+        if not self._immich_provider.write_allowed("albumUploads", default=True):
+            raise DAVError(HTTP_FORBIDDEN)
         if not is_supported_media_upload_name(name):
             raise DAVError(HTTP_FORBIDDEN)
         return UploadResource(
@@ -1725,6 +2038,265 @@ class HourBucketCollection(ReadOnlyResourceMixin, DAVCollection):  # type: ignor
         return AssetResource(f"{self.path.rstrip('/')}/{name}", self.environ, asset)
 
 
+class ViewsRootCollection(ReadOnlyResourceMixin, DAVCollection):  # type: ignore[misc]
+    """Collection listing admin-defined saved views."""
+
+    @property
+    def _immich_provider(self) -> ImmichProvider:
+        return self.provider  # type: ignore[return-value]
+
+    def get_display_name(self) -> str:
+        """Return the collection display name."""
+        return "Views"
+
+    def get_member_names(self) -> list[str]:
+        """Return saved view folder names."""
+        return [
+            README_FILENAME,
+            *[str(view["davName"]) for view in self._immich_provider.saved_view_entries()],
+        ]
+
+    def get_member(self, name: str) -> "ReadmeResource | SavedViewCollection | None":
+        """Return a saved view folder."""
+        if name == README_FILENAME:
+            return ReadmeResource(
+                f"{self.path.rstrip('/')}/{name}",
+                self.environ,
+                self._immich_provider._readme_content(["Views", name]),
+            )
+        view = self._immich_provider.saved_view_by_name(name)
+        if view is None:
+            return None
+        return SavedViewCollection(f"{self.path.rstrip('/')}/{name}", self.environ, view)
+
+
+class SavedViewCollection(ReadOnlyResourceMixin, DAVCollection):  # type: ignore[misc]
+    """Collection representing one saved view."""
+
+    def __init__(
+        self,
+        path: str,
+        environ: dict[str, Any],
+        view: dict[str, Any],
+    ) -> None:
+        """Initialize the saved view collection."""
+        super().__init__(path, environ)
+        self._view = view
+
+    @property
+    def _immich_provider(self) -> ImmichProvider:
+        return self.provider  # type: ignore[return-value]
+
+    @property
+    def _filters(self) -> dict[str, Any]:
+        filters = self._view.get("filters")
+        return filters if isinstance(filters, dict) else {}
+
+    def get_display_name(self) -> str:
+        """Return the saved view display name."""
+        return str(self._view.get("davName") or self._view.get("name") or "View")
+
+    def get_member_names(self) -> list[str]:
+        """Return flat asset names or top-level year buckets."""
+        if self._view.get("layout") == "flat":
+            return list(
+                self._immich_provider.list_saved_view_assets(
+                    self.environ,
+                    self._filters,
+                ).keys()
+            )
+        return self._immich_provider.list_saved_view_date_buckets(
+            self.environ,
+            self._filters,
+            None,
+            level="year",
+        )
+
+    def get_member(self, name: str) -> "SavedViewDateBucketCollection | AssetResource | None":
+        """Return a child bucket or flat asset."""
+        if self._view.get("layout") == "flat":
+            asset = self._immich_provider.resolve_saved_view_asset(
+                self.environ,
+                self._filters,
+                name,
+            )
+            if asset is None:
+                return None
+            return AssetResource(f"{self.path.rstrip('/')}/{name}", self.environ, asset)
+
+        parts = ["View", name]
+        date_range = self._immich_provider._date_range_from_parts(parts)
+        if date_range is None or name not in self.get_member_names():
+            return None
+        return SavedViewDateBucketCollection(
+            f"{self.path.rstrip('/')}/{name}",
+            self.environ,
+            self._view,
+            date_range,
+        )
+
+
+class SavedViewDateBucketCollection(ReadOnlyResourceMixin, DAVCollection):  # type: ignore[misc]
+    """Date bucket inside a saved view."""
+
+    def __init__(
+        self,
+        path: str,
+        environ: dict[str, Any],
+        view: dict[str, Any],
+        date_range: DateRange,
+    ) -> None:
+        """Initialize the saved view date bucket."""
+        super().__init__(path, environ)
+        self._view = view
+        self._date_range = date_range
+
+    @property
+    def _immich_provider(self) -> ImmichProvider:
+        return self.provider  # type: ignore[return-value]
+
+    @property
+    def _filters(self) -> dict[str, Any]:
+        filters = self._view.get("filters")
+        return filters if isinstance(filters, dict) else {}
+
+    def _parts(self, child_name: str | None = None) -> list[str]:
+        parts = [p for p in self.path.rstrip("/").split("/") if p]
+        if len(parts) >= 2:
+            parts = ["View", *parts[2:]]
+        if child_name is not None:
+            parts.append(child_name)
+        return parts
+
+    def get_member_names(self) -> list[str]:
+        """Return child month, day, hour, or file names."""
+        parts = self._parts()
+        if len(parts) == 2:
+            return self._immich_provider.list_saved_view_date_buckets(
+                self.environ,
+                self._filters,
+                self._date_range,
+                level="month",
+            )
+        if len(parts) == 3:
+            return self._immich_provider.list_saved_view_date_buckets(
+                self.environ,
+                self._filters,
+                self._date_range,
+                level="day",
+            )
+        if self._immich_provider.should_split_saved_view_day(
+            self.environ,
+            self._filters,
+            self._date_range,
+        ):
+            return self._immich_provider.list_saved_view_hour_buckets(
+                self.environ,
+                self._filters,
+                self._date_range,
+            )
+        return list(
+            self._immich_provider.list_saved_view_date_assets(
+                self.environ,
+                self._filters,
+                self._date_range,
+            ).keys()
+        )
+
+    def get_member(
+        self,
+        name: str,
+    ) -> "SavedViewDateBucketCollection | SavedViewHourBucketCollection | AssetResource | None":
+        """Return a child bucket or asset."""
+        parts = self._parts(name)
+        if len(parts) <= 4:
+            date_range = self._immich_provider._date_range_from_parts(parts)
+            if date_range is None or name not in self.get_member_names():
+                return None
+            return SavedViewDateBucketCollection(
+                f"{self.path.rstrip('/')}/{name}",
+                self.environ,
+                self._view,
+                date_range,
+            )
+
+        if self._immich_provider.should_split_saved_view_day(
+            self.environ,
+            self._filters,
+            self._date_range,
+        ):
+            hour_range = self._immich_provider._hour_range_from_environ(self.environ, parts)
+            if hour_range is None or name not in self.get_member_names():
+                return None
+            return SavedViewHourBucketCollection(
+                f"{self.path.rstrip('/')}/{name}",
+                self.environ,
+                self._view,
+                hour_range,
+            )
+
+        asset = self._immich_provider.resolve_saved_view_date_asset(
+            self.environ,
+            self._filters,
+            self._date_range,
+            name,
+        )
+        if asset is None:
+            return None
+        return AssetResource(f"{self.path.rstrip('/')}/{name}", self.environ, asset)
+
+
+class SavedViewHourBucketCollection(ReadOnlyResourceMixin, DAVCollection):  # type: ignore[misc]
+    """Hour bucket inside a saved view."""
+
+    def __init__(
+        self,
+        path: str,
+        environ: dict[str, Any],
+        view: dict[str, Any],
+        hour_range: HourRange,
+    ) -> None:
+        """Initialize the saved view hour bucket."""
+        super().__init__(path, environ)
+        self._view = view
+        self._hour_range = hour_range
+
+    @property
+    def _immich_provider(self) -> ImmichProvider:
+        return self.provider  # type: ignore[return-value]
+
+    @property
+    def _filters(self) -> dict[str, Any]:
+        filters = self._view.get("filters")
+        return filters if isinstance(filters, dict) else {}
+
+    def get_display_name(self) -> str:
+        """Return the hour bucket display name."""
+        return f"{self._hour_range.hour:02d}"
+
+    def get_member_names(self) -> list[str]:
+        """Return asset filenames in this hour bucket."""
+        return list(
+            self._immich_provider.list_saved_view_hour_assets(
+                self.environ,
+                self._filters,
+                self._hour_range,
+            ).keys()
+        )
+
+    def get_member(self, name: str) -> "AssetResource | None":
+        """Return an asset inside this hour bucket."""
+        asset = self._immich_provider.resolve_saved_view_hour_asset(
+            self.environ,
+            self._filters,
+            self._hour_range,
+            name,
+        )
+        if asset is None:
+            return None
+        return AssetResource(f"{self.path.rstrip('/')}/{name}", self.environ, asset)
+
+
 class WellKnownCollection(ReadOnlyResourceMixin, DAVCollection):  # type: ignore[misc]
     """Collection for machine-readable service metadata."""
 
@@ -1760,6 +2332,7 @@ class DiagnosticsResource(ReadOnlyResourceMixin, DAVNonCollection):  # type: ign
         """Initialize diagnostics resource."""
         super().__init__(path, environ)
         immich_url = provider._immich_url if provider is not None else ""
+        write_policy = provider.write_policy() if provider is not None else {}
         payload = {
             "service": "immich-bridge",
             "version": "0.1.0",
@@ -1773,11 +2346,11 @@ class DiagnosticsResource(ReadOnlyResourceMixin, DAVNonCollection):  # type: ign
                 "nativeFsApi": False,
                 "readOnly": False,
                 "writes": True,
-                "rootUploads": True,
-                "albumUploads": True,
-                "albumCreate": True,
-                "albumMembershipDelete": True,
-                "permanentDelete": False,
+                "rootUploads": bool(write_policy.get("rootUploads", True)),
+                "albumUploads": bool(write_policy.get("albumUploads", True)),
+                "albumCreate": bool(write_policy.get("albumCreate", True)),
+                "albumMembershipDelete": bool(write_policy.get("albumMembershipDelete", True)),
+                "permanentDelete": bool(write_policy.get("permanentDelete", False)),
                 "rangeReads": True,
                 "locks": bool(provider and provider._webdav_locks_enabled),
                 "blobCache": bool(provider and provider._blob_cache),
@@ -1882,6 +2455,8 @@ class AssetResource(ReadOnlyResourceMixin, DAVNonCollection):  # type: ignore[mi
     def handle_delete(self) -> bool:
         """Remove album membership for album-scoped assets."""
         if self._album_id is None:
+            self._reject_write()
+        if not self._immich_provider.write_allowed("albumMembershipDelete", default=True):
             self._reject_write()
         self._immich_provider.remove_asset_from_album(
             self.environ,

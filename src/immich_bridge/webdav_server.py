@@ -558,6 +558,7 @@ def create_webdav_app(
     blob_cache_max_range_bytes: int = 8_388_608,
     blob_cache_ttl_seconds: int = 86_400,
     upload_receipt_ttl_seconds: int = 1800,
+    database_url: str = "sqlite:////tmp/immich-bridge/immich-bridge.db",
 ) -> ClientCompatibilityMiddleware:
     """Create the wsgidav WSGI application."""
     provider = ImmichProvider(
@@ -578,6 +579,7 @@ def create_webdav_app(
         blob_cache_max_range_bytes=blob_cache_max_range_bytes,
         blob_cache_ttl_seconds=blob_cache_ttl_seconds,
         upload_receipt_ttl_seconds=upload_receipt_ttl_seconds,
+        database_url=database_url,
     )
     authenticator_class = _make_authenticator_class(
         immich_url,
@@ -680,6 +682,7 @@ class WebDAVServer:
         blob_cache_max_range_bytes: int = 8_388_608,
         blob_cache_ttl_seconds: int = 86_400,
         upload_receipt_ttl_seconds: int = 1800,
+        database_url: str = "sqlite:////tmp/immich-bridge/immich-bridge.db",
     ) -> None:
         """Initialize the WebDAV server."""
         self._app = create_webdav_app(
@@ -712,6 +715,7 @@ class WebDAVServer:
             blob_cache_max_range_bytes=blob_cache_max_range_bytes,
             blob_cache_ttl_seconds=blob_cache_ttl_seconds,
             upload_receipt_ttl_seconds=upload_receipt_ttl_seconds,
+            database_url=database_url,
         )
         self._server = cheroot.wsgi.Server((host, port), self._app)
         self._host = host
