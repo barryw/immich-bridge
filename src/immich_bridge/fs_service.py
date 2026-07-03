@@ -65,9 +65,11 @@ class ImmichFilesystem:
             "taken_after",
             "taken_before",
             "rating",
+            "query",
             "original_file_name",
             "ocr",
             "city",
+            "state",
             "country",
         }
         search_filters: dict[str, Any] = {}

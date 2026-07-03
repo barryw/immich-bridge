@@ -248,10 +248,12 @@ def test_admin_options_and_match_count_use_immich_api(tmp_path: Path) -> None:
                     "taken_after": None,
                     "taken_before": None,
                     "rating": None,
+                    "query": "beach",
                     "original_file_name": None,
                     "ocr": None,
-                    "city": None,
-                    "country": None,
+                    "city": "Los Angeles",
+                    "state": "California",
+                    "country": "USA",
                 }
             },
         )
@@ -263,3 +265,7 @@ def test_admin_options_and_match_count_use_immich_api(tmp_path: Path) -> None:
     assert count.status_code == 200
     assert count.json()["count"] == 11
     instance.search_assets.assert_called_once()
+    assert instance.search_assets.call_args.kwargs["query"] == "beach"
+    assert instance.search_assets.call_args.kwargs["city"] == "Los Angeles"
+    assert instance.search_assets.call_args.kwargs["state"] == "California"
+    assert instance.search_assets.call_args.kwargs["country"] == "USA"

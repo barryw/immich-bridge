@@ -626,6 +626,14 @@ function ViewComposer({
 
       <div className="form-grid">
         <label>
+          Search
+          <input
+            value={filters.query ?? ""}
+            onChange={(event) => updateFilter("query", event.target.value || null)}
+            placeholder="beach, birthday, receipt"
+          />
+        </label>
+        <label>
           Taken after
           <input
             type="date"
@@ -672,6 +680,13 @@ function ViewComposer({
           <input
             value={filters.city ?? ""}
             onChange={(event) => updateFilter("city", event.target.value || null)}
+          />
+        </label>
+        <label>
+          State / province
+          <input
+            value={filters.state ?? ""}
+            onChange={(event) => updateFilter("state", event.target.value || null)}
           />
         </label>
         <label>
@@ -1054,6 +1069,7 @@ function filterChips(filters: ViewFilters, lookup: OptionLookup) {
   if (filters.media_type === "IMAGE") chips.push("Images");
   if (filters.media_type === "VIDEO") chips.push("Videos");
   if (filters.rating != null) chips.push(`Rating ${filters.rating}+`);
+  if (filters.query) chips.push(`Search: ${filters.query}`);
   if (filters.tag_ids.length) chips.push(`Tags: ${labelsForIds(filters.tag_ids, lookup.tags)}`);
   if (filters.person_ids.length) chips.push(`People: ${labelsForIds(filters.person_ids, lookup.people)}`);
   if (filters.album_ids.length) chips.push(`${filters.album_ids.length} album IDs`);
@@ -1063,6 +1079,7 @@ function filterChips(filters: ViewFilters, lookup: OptionLookup) {
   if (filters.original_file_name) chips.push(`Filename: ${filters.original_file_name}`);
   if (filters.ocr) chips.push(`OCR: ${filters.ocr}`);
   if (filters.city) chips.push(`City: ${filters.city}`);
+  if (filters.state) chips.push(`State: ${filters.state}`);
   if (filters.country) chips.push(`Country: ${filters.country}`);
   return chips.length ? chips : ["Any asset"];
 }
@@ -1122,9 +1139,11 @@ function cleanPayload(payload: SavedViewPayload): SavedViewPayload {
       album_ids: uniqueIds(payload.filters.album_ids),
       person_ids: uniqueIds(payload.filters.person_ids),
       tag_ids: uniqueIds(payload.filters.tag_ids),
+      query: blankToNull(payload.filters.query),
       original_file_name: blankToNull(payload.filters.original_file_name),
       ocr: blankToNull(payload.filters.ocr),
       city: blankToNull(payload.filters.city),
+      state: blankToNull(payload.filters.state),
       country: blankToNull(payload.filters.country)
     }
   };

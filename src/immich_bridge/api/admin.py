@@ -74,9 +74,11 @@ class ViewFilters(BaseModel):
     taken_after: str | None = None
     taken_before: str | None = None
     rating: int | None = Field(default=None, ge=1, le=5)
+    query: str | None = None
     original_file_name: str | None = None
     ocr: str | None = None
     city: str | None = None
+    state: str | None = None
     country: str | None = None
 
 
@@ -636,9 +638,11 @@ def _search_kwargs_from_filters(filters: dict[str, Any]) -> dict[str, Any]:
         "taken_after",
         "taken_before",
         "rating",
+        "query",
         "original_file_name",
         "ocr",
         "city",
+        "state",
         "country",
     }
     return {

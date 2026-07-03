@@ -622,9 +622,11 @@ class ImmichClient:
         taken_after: str | None = None,
         taken_before: str | None = None,
         rating: int | None = None,
+        query: str | None = None,
         original_file_name: str | None = None,
         ocr: str | None = None,
         city: str | None = None,
+        state: str | None = None,
         country: str | None = None,
         with_exif: bool = True,
     ) -> SearchPage:
@@ -652,12 +654,16 @@ class ImmichClient:
             body["takenBefore"] = taken_before
         if rating is not None:
             body["rating"] = rating
+        if query:
+            body["query"] = query
         if original_file_name:
             body["originalFileName"] = original_file_name
         if ocr:
             body["ocr"] = ocr
         if city:
             body["city"] = city
+        if state:
+            body["state"] = state
         if country:
             body["country"] = country
 

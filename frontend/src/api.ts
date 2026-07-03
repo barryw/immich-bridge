@@ -21,9 +21,11 @@ export type ViewFilters = {
   taken_after: string | null;
   taken_before: string | null;
   rating: number | null;
+  query: string | null;
   original_file_name: string | null;
   ocr: string | null;
   city: string | null;
+  state: string | null;
   country: string | null;
 };
 
@@ -96,9 +98,11 @@ export const emptyFilters: ViewFilters = {
   taken_after: null,
   taken_before: null,
   rating: null,
+  query: null,
   original_file_name: null,
   ocr: null,
   city: null,
+  state: null,
   country: null
 };
 
