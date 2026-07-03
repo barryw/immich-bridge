@@ -533,6 +533,13 @@ class ImmichProvider(DAVProvider):  # type: ignore[misc]
                 return view
         return None
 
+    def saved_view_by_id(self, view_id: str) -> dict[str, Any] | None:
+        """Resolve a saved view by durable id."""
+        for view in self.saved_view_entries():
+            if str(view.get("id")) == view_id:
+                return view
+        return None
+
     def _run_fs(self, operation: Any) -> Any:
         try:
             return operation()
@@ -2081,43 +2088,85 @@ class SavedViewCollection(ReadOnlyResourceMixin, DAVCollection):  # type: ignore
     ) -> None:
         """Initialize the saved view collection."""
         super().__init__(path, environ)
-        self._view = view
+        self._view_id = str(view.get("id"))
+        self._dav_name = str(view.get("davName") or view.get("name") or "View")
 
     @property
     def _immich_provider(self) -> ImmichProvider:
         return self.provider  # type: ignore[return-value]
 
     @property
-    def _filters(self) -> dict[str, Any]:
-        filters = self._view.get("filters")
+    def _view(self) -> dict[str, Any] | None:
+        view = self._immich_provider.saved_view_by_id(self._view_id)
+        if view is None or view.get("davName") != self._dav_name:
+            return None
+        return view
+
+    def _filters(self, view: dict[str, Any]) -> dict[str, Any]:
+        filters = view.get("filters")
         return filters if isinstance(filters, dict) else {}
 
     def get_display_name(self) -> str:
         """Return the saved view display name."""
-        return str(self._view.get("davName") or self._view.get("name") or "View")
+        return self._dav_name
+
+    def support_etag(self) -> bool:
+        """Return stable collection ETags for saved view metadata."""
+        return True
+
+    def get_etag(self) -> str:
+        """Return an ETag that changes when the saved view changes."""
+        view = self._view
+        payload = {
+            "id": self._view_id,
+            "davName": self._dav_name,
+            "updatedAt": view.get("updatedAt") if view else None,
+            "layout": view.get("layout") if view else None,
+            "filters": view.get("filters") if view else None,
+        }
+        return hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+    def get_last_modified(self) -> float:
+        """Return saved view update time for DAV cache validation."""
+        view = self._view
+        updated_at = view.get("updatedAt") if view else None
+        if not isinstance(updated_at, str):
+            return datetime.now(timezone.utc).timestamp()
+        try:
+            return datetime.fromisoformat(updated_at).timestamp()
+        except ValueError:
+            return datetime.now(timezone.utc).timestamp()
 
     def get_member_names(self) -> list[str]:
         """Return flat asset names or top-level year buckets."""
-        if self._view.get("layout") == "flat":
+        view = self._view
+        if view is None:
+            return []
+        filters = self._filters(view)
+        if view.get("layout") == "flat":
             return list(
                 self._immich_provider.list_saved_view_assets(
                     self.environ,
-                    self._filters,
+                    filters,
                 ).keys()
             )
         return self._immich_provider.list_saved_view_date_buckets(
             self.environ,
-            self._filters,
+            filters,
             None,
             level="year",
         )
 
     def get_member(self, name: str) -> "SavedViewDateBucketCollection | AssetResource | None":
         """Return a child bucket or flat asset."""
-        if self._view.get("layout") == "flat":
+        view = self._view
+        if view is None:
+            return None
+        filters = self._filters(view)
+        if view.get("layout") == "flat":
             asset = self._immich_provider.resolve_saved_view_asset(
                 self.environ,
-                self._filters,
+                filters,
                 name,
             )
             if asset is None:
@@ -2131,7 +2180,7 @@ class SavedViewCollection(ReadOnlyResourceMixin, DAVCollection):  # type: ignore
         return SavedViewDateBucketCollection(
             f"{self.path.rstrip('/')}/{name}",
             self.environ,
-            self._view,
+            view,
             date_range,
         )
 
@@ -2148,7 +2197,8 @@ class SavedViewDateBucketCollection(ReadOnlyResourceMixin, DAVCollection):  # ty
     ) -> None:
         """Initialize the saved view date bucket."""
         super().__init__(path, environ)
-        self._view = view
+        self._view_id = str(view.get("id"))
+        self._dav_name = str(view.get("davName") or view.get("name") or "View")
         self._date_range = date_range
 
     @property
@@ -2156,8 +2206,16 @@ class SavedViewDateBucketCollection(ReadOnlyResourceMixin, DAVCollection):  # ty
         return self.provider  # type: ignore[return-value]
 
     @property
-    def _filters(self) -> dict[str, Any]:
-        filters = self._view.get("filters")
+    def _view(self) -> dict[str, Any] | None:
+        view = self._immich_provider.saved_view_by_id(self._view_id)
+        if view is None or view.get("davName") != self._dav_name:
+            return None
+        if view.get("layout") == "flat":
+            return None
+        return view
+
+    def _filters(self, view: dict[str, Any]) -> dict[str, Any]:
+        filters = view.get("filters")
         return filters if isinstance(filters, dict) else {}
 
     def _parts(self, child_name: str | None = None) -> list[str]:
@@ -2170,35 +2228,39 @@ class SavedViewDateBucketCollection(ReadOnlyResourceMixin, DAVCollection):  # ty
 
     def get_member_names(self) -> list[str]:
         """Return child month, day, hour, or file names."""
+        view = self._view
+        if view is None:
+            return []
+        filters = self._filters(view)
         parts = self._parts()
         if len(parts) == 2:
             return self._immich_provider.list_saved_view_date_buckets(
                 self.environ,
-                self._filters,
+                filters,
                 self._date_range,
                 level="month",
             )
         if len(parts) == 3:
             return self._immich_provider.list_saved_view_date_buckets(
                 self.environ,
-                self._filters,
+                filters,
                 self._date_range,
                 level="day",
             )
         if self._immich_provider.should_split_saved_view_day(
             self.environ,
-            self._filters,
+            filters,
             self._date_range,
         ):
             return self._immich_provider.list_saved_view_hour_buckets(
                 self.environ,
-                self._filters,
+                filters,
                 self._date_range,
             )
         return list(
             self._immich_provider.list_saved_view_date_assets(
                 self.environ,
-                self._filters,
+                filters,
                 self._date_range,
             ).keys()
         )
@@ -2208,6 +2270,10 @@ class SavedViewDateBucketCollection(ReadOnlyResourceMixin, DAVCollection):  # ty
         name: str,
     ) -> "SavedViewDateBucketCollection | SavedViewHourBucketCollection | AssetResource | None":
         """Return a child bucket or asset."""
+        view = self._view
+        if view is None:
+            return None
+        filters = self._filters(view)
         parts = self._parts(name)
         if len(parts) <= 4:
             date_range = self._immich_provider._date_range_from_parts(parts)
@@ -2216,13 +2282,13 @@ class SavedViewDateBucketCollection(ReadOnlyResourceMixin, DAVCollection):  # ty
             return SavedViewDateBucketCollection(
                 f"{self.path.rstrip('/')}/{name}",
                 self.environ,
-                self._view,
+                view,
                 date_range,
             )
 
         if self._immich_provider.should_split_saved_view_day(
             self.environ,
-            self._filters,
+            filters,
             self._date_range,
         ):
             hour_range = self._immich_provider._hour_range_from_environ(self.environ, parts)
@@ -2231,13 +2297,13 @@ class SavedViewDateBucketCollection(ReadOnlyResourceMixin, DAVCollection):  # ty
             return SavedViewHourBucketCollection(
                 f"{self.path.rstrip('/')}/{name}",
                 self.environ,
-                self._view,
+                view,
                 hour_range,
             )
 
         asset = self._immich_provider.resolve_saved_view_date_asset(
             self.environ,
-            self._filters,
+            filters,
             self._date_range,
             name,
         )
@@ -2258,7 +2324,8 @@ class SavedViewHourBucketCollection(ReadOnlyResourceMixin, DAVCollection):  # ty
     ) -> None:
         """Initialize the saved view hour bucket."""
         super().__init__(path, environ)
-        self._view = view
+        self._view_id = str(view.get("id"))
+        self._dav_name = str(view.get("davName") or view.get("name") or "View")
         self._hour_range = hour_range
 
     @property
@@ -2266,8 +2333,16 @@ class SavedViewHourBucketCollection(ReadOnlyResourceMixin, DAVCollection):  # ty
         return self.provider  # type: ignore[return-value]
 
     @property
-    def _filters(self) -> dict[str, Any]:
-        filters = self._view.get("filters")
+    def _view(self) -> dict[str, Any] | None:
+        view = self._immich_provider.saved_view_by_id(self._view_id)
+        if view is None or view.get("davName") != self._dav_name:
+            return None
+        if view.get("layout") == "flat":
+            return None
+        return view
+
+    def _filters(self, view: dict[str, Any]) -> dict[str, Any]:
+        filters = view.get("filters")
         return filters if isinstance(filters, dict) else {}
 
     def get_display_name(self) -> str:
@@ -2276,19 +2351,25 @@ class SavedViewHourBucketCollection(ReadOnlyResourceMixin, DAVCollection):  # ty
 
     def get_member_names(self) -> list[str]:
         """Return asset filenames in this hour bucket."""
+        view = self._view
+        if view is None:
+            return []
         return list(
             self._immich_provider.list_saved_view_hour_assets(
                 self.environ,
-                self._filters,
+                self._filters(view),
                 self._hour_range,
             ).keys()
         )
 
     def get_member(self, name: str) -> "AssetResource | None":
         """Return an asset inside this hour bucket."""
+        view = self._view
+        if view is None:
+            return None
         asset = self._immich_provider.resolve_saved_view_hour_asset(
             self.environ,
-            self._filters,
+            self._filters(view),
             self._hour_range,
             name,
         )

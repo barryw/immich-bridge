@@ -309,6 +309,45 @@ def test_saved_views_are_exposed_as_read_only_dav_folders(tmp_path: Path) -> Non
     assert any(call.get("person_ids") == ["person-1"] for call in client.search_calls)
 
 
+def test_saved_view_layout_changes_are_reflected_in_existing_collection(
+    tmp_path: Path,
+) -> None:
+    """Saved view DAV collections should re-read layout before listing children."""
+    database_url = f"sqlite:///{tmp_path / 'bridge.db'}"
+    get_admin_store.cache_clear()
+    store = get_admin_store(database_url)
+    view_payload = {
+        "id": "view-1",
+        "name": "Kids",
+        "description": "",
+        "enabled": True,
+        "layout": "date_buckets",
+        "filters": {"tag_ids": ["tag-1"]},
+    }
+    store.upsert_view(view_payload)
+    client = FakeImmichClient()
+    provider = ImmichProvider("http://immich.test/api", database_url=database_url)
+    provider._client = lambda environ: client  # type: ignore[method-assign]
+    asset_name = "2026-06-28 16.38.37 IMG-0001--c1ada054.heic"
+
+    views = provider.get_resource_inst("/Views", auth_environ())
+    assert views is not None
+    view = views.get_member("Kids")
+    assert view is not None
+    assert view.get_member_names() == ["2026"]
+    stale_year = view.get_member("2026")
+    assert stale_year is not None
+
+    store.upsert_view({**view_payload, "layout": "flat"})
+
+    assert view.get_member_names() == [asset_name]
+    assert view.get_member("2026") is None
+    assert stale_year.get_member_names() == []
+
+    asset = provider.get_resource_inst(f"/Views/Kids/{asset_name}", auth_environ())
+    assert asset is not None
+
+
 def test_root_rejects_non_media_collection_delete_and_move_operations() -> None:
     """The fixed root namespace should only accept media file uploads."""
     provider = ImmichProvider("http://immich.test/api")
