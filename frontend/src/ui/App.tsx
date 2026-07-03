@@ -4,6 +4,7 @@ import {
   Activity,
   Check,
   Database,
+  FileText,
   FolderTree,
   Gauge,
   KeyRound,
@@ -19,6 +20,7 @@ import {
   ShieldCheck,
   Tags,
   Trash2,
+  UploadCloud,
   Users,
   X
 } from "lucide-react";
@@ -34,13 +36,12 @@ import {
   WritePolicy
 } from "../api";
 
-type Section = "overview" | "views" | "mount" | "writes" | "diagnostics";
+type Section = "overview" | "views" | "mount" | "diagnostics";
 
 const navItems: Array<{ id: Section; label: string; icon: typeof FolderTree }> = [
   { id: "overview", label: "Overview", icon: Gauge },
   { id: "views", label: "Views", icon: FolderTree },
-  { id: "mount", label: "Mount", icon: Database },
-  { id: "writes", label: "Writes", icon: ShieldCheck },
+  { id: "mount", label: "Policy", icon: ShieldCheck },
   { id: "diagnostics", label: "Diagnostics", icon: Activity }
 ];
 
@@ -213,8 +214,7 @@ function AdminWorkspace({ section }: { section: Section }) {
 
       {section === "overview" && <Overview diagnostics={diagnostics.data} />}
       {section === "views" && <ViewsPanel />}
-      {section === "mount" && <MountPanel />}
-      {section === "writes" && <WritePolicyPanel />}
+      {section === "mount" && <MountPolicyPanel />}
       {section === "diagnostics" && <DiagnosticsPanel diagnostics={diagnostics.data} />}
     </>
   );
@@ -859,154 +859,299 @@ function OptionPicker({
   );
 }
 
-function MountPanel() {
+function MountPolicyPanel() {
   const queryClient = useQueryClient();
   const mount = useQuery({ queryKey: ["mount"], queryFn: api.mount });
-  const mutation = useMutation({
-    mutationFn: api.updateMount,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["mount"] })
-  });
-  const [draft, setDraft] = useState<MountSettings | null>(null);
-  useEffect(() => {
-    if (mount.data) setDraft(mount.data);
-  }, [mount.data]);
-  if (!draft) return <div className="loading-strip">Loading</div>;
-
-  return (
-    <SettingsForm onSubmit={() => mutation.mutate(draft)} pending={mutation.isPending}>
-      <ToggleGrid
-        values={[
-          ["albums_enabled", "Albums"],
-          ["timeline_enabled", "Timeline"],
-          ["favorites_enabled", "Favorites"],
-          ["views_enabled", "Views"],
-          ["tags_enabled", "Tags"],
-          ["people_enabled", "People"]
-        ]}
-        draft={draft}
-        onChange={(key, value) => setDraft({ ...draft, [key]: value })}
-      />
-      <div className="form-grid">
-        <label>
-          Album split
-          <input
-            type="number"
-            value={draft.album_folder_split_threshold}
-            onChange={(event) =>
-              setDraft({ ...draft, album_folder_split_threshold: Number(event.target.value) })
-            }
-          />
-        </label>
-        <label>
-          Day split
-          <input
-            type="number"
-            value={draft.day_folder_split_threshold}
-            onChange={(event) =>
-              setDraft({ ...draft, day_folder_split_threshold: Number(event.target.value) })
-            }
-          />
-        </label>
-        <label>
-          Filenames
-          <select
-            value={draft.filename_mode}
-            onChange={(event) =>
-              setDraft({ ...draft, filename_mode: event.target.value as MountSettings["filename_mode"] })
-            }
-          >
-            <option value="date-original-id">Date original ID</option>
-            <option value="original">Original</option>
-            <option value="stable">Stable</option>
-          </select>
-        </label>
-      </div>
-    </SettingsForm>
-  );
-}
-
-function WritePolicyPanel() {
-  const queryClient = useQueryClient();
   const policy = useQuery({ queryKey: ["write-policy"], queryFn: api.writePolicy });
+  const [draftMount, setDraftMount] = useState<MountSettings | null>(null);
+  const [draftPolicy, setDraftPolicy] = useState<WritePolicy | null>(null);
   const mutation = useMutation({
-    mutationFn: api.updateWritePolicy,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["write-policy"] })
+    mutationFn: async (draft: { mount: MountSettings; policy: WritePolicy }) => {
+      const savedMount = await api.updateMount(draft.mount);
+      const savedPolicy = await api.updateWritePolicy({
+        ...draft.policy,
+        permanent_delete: false
+      });
+      return { mount: savedMount, policy: savedPolicy };
+    },
+    onSuccess: (saved) => {
+      setDraftMount(saved.mount);
+      setDraftPolicy(saved.policy);
+      queryClient.invalidateQueries({ queryKey: ["mount"] });
+      queryClient.invalidateQueries({ queryKey: ["write-policy"] });
+      queryClient.invalidateQueries({ queryKey: ["diagnostics"] });
+    }
   });
-  const [draft, setDraft] = useState<WritePolicy | null>(null);
   useEffect(() => {
-    if (policy.data) setDraft(policy.data);
+    if (mount.data) setDraftMount(mount.data);
+  }, [mount.data]);
+  useEffect(() => {
+    if (policy.data) setDraftPolicy(policy.data);
   }, [policy.data]);
-  if (!draft) return <div className="loading-strip">Loading</div>;
+  if (!draftMount || !draftPolicy) return <div className="loading-strip">Loading</div>;
 
-  return (
-    <SettingsForm onSubmit={() => mutation.mutate(draft)} pending={mutation.isPending}>
-      <ToggleGrid
-        values={[
-          ["root_uploads", "Root uploads"],
-          ["album_uploads", "Album uploads"],
-          ["album_create", "Album create"],
-          ["album_membership_delete", "Album delete"],
-          ["permanent_delete", "Permanent delete"],
-          ["move_copy", "Move copy"],
-          ["overwrite", "Overwrite"]
-        ]}
-        draft={draft}
-        onChange={(key, value) => setDraft({ ...draft, [key]: value })}
-      />
-    </SettingsForm>
-  );
-}
+  const setMount = <K extends keyof MountSettings>(key: K, value: MountSettings[K]) => {
+    setDraftMount((current) => (current ? { ...current, [key]: value } : current));
+  };
+  const setPolicy = <K extends keyof WritePolicy>(key: K, value: WritePolicy[K]) => {
+    setDraftPolicy((current) => (current ? { ...current, [key]: value } : current));
+  };
 
-function SettingsForm({
-  children,
-  pending,
-  onSubmit
-}: {
-  children: React.ReactNode;
-  pending: boolean;
-  onSubmit: () => void;
-}) {
   return (
     <form
-      className="settings-panel"
+      className="settings-panel policy-panel"
       onSubmit={(event) => {
         event.preventDefault();
-        onSubmit();
+        mutation.mutate({ mount: draftMount, policy: draftPolicy });
       }}
     >
-      {children}
-      <div className="panel-actions">
-        <button className="primary-button" disabled={pending}>
+      <div className="policy-toolbar">
+        <div>
+          <h2>Filesystem policy</h2>
+          <span>Mount visibility and DAV writes by folder</span>
+        </div>
+        <button className="primary-button" disabled={mutation.isPending}>
           <Save size={16} />
-          <span>{pending ? "Saving" : "Save"}</span>
+          <span>{mutation.isPending ? "Saving" : "Save"}</span>
         </button>
+      </div>
+
+      {(mount.isError || policy.isError || mutation.isError) && (
+        <div className="form-error">
+          {messageFromError(mount.error) ??
+            messageFromError(policy.error) ??
+            messageFromError(mutation.error)}
+        </div>
+      )}
+
+      <div className="policy-tree">
+        <PolicyTreeNode icon={FolderTree} label="Root" path="/">
+          <PolicyToggle
+            icon={UploadCloud}
+            label="Uploads"
+            detail="Allow raw media uploads at the DAV root"
+            checked={draftPolicy.root_uploads}
+            onChange={(value) => setPolicy("root_uploads", value)}
+          />
+          <PolicyToggle
+            icon={ShieldCheck}
+            label="Move / copy"
+            detail="Allow DAV move and copy operations"
+            checked={draftPolicy.move_copy}
+            onChange={(value) => setPolicy("move_copy", value)}
+          />
+          <PolicyToggle
+            icon={FileText}
+            label="Overwrite"
+            detail="Allow writes over existing DAV resources"
+            checked={draftPolicy.overwrite}
+            onChange={(value) => setPolicy("overwrite", value)}
+          />
+        </PolicyTreeNode>
+
+        <PolicyTreeNode
+          icon={FolderTree}
+          label="Albums"
+          path="/Albums"
+          checked={draftMount.albums_enabled}
+          onChange={(value) => setMount("albums_enabled", value)}
+        >
+          <PolicyToggle
+            icon={UploadCloud}
+            label="Uploads"
+            detail="Drop media into an album and add it to that album"
+            checked={draftPolicy.album_uploads}
+            onChange={(value) => setPolicy("album_uploads", value)}
+          />
+          <PolicyToggle
+            icon={Plus}
+            label="Create"
+            detail="Create Immich albums with DAV MKCOL"
+            checked={draftPolicy.album_create}
+            onChange={(value) => setPolicy("album_create", value)}
+          />
+          <PolicyToggle
+            icon={Trash2}
+            label="Delete"
+            detail="Remove album membership without deleting the asset"
+            checked={draftPolicy.album_membership_delete}
+            onChange={(value) => setPolicy("album_membership_delete", value)}
+          />
+          <PolicyField label="Split threshold" detail="Album asset count before date buckets appear">
+            <input
+              type="number"
+              min={0}
+              value={draftMount.album_folder_split_threshold}
+              onChange={(event) =>
+                setMount("album_folder_split_threshold", Number(event.target.value))
+              }
+            />
+          </PolicyField>
+        </PolicyTreeNode>
+
+        <PolicyTreeNode
+          icon={FolderTree}
+          label="Timeline"
+          path="/Timeline"
+          checked={draftMount.timeline_enabled}
+          onChange={(value) => setMount("timeline_enabled", value)}
+        >
+          <PolicyField label="Day split threshold" detail="Day asset count before hour buckets appear">
+            <input
+              type="number"
+              min={0}
+              value={draftMount.day_folder_split_threshold}
+              onChange={(event) =>
+                setMount("day_folder_split_threshold", Number(event.target.value))
+              }
+            />
+          </PolicyField>
+          <PolicyField label="Filenames" detail="DAV display filename strategy">
+            <select
+              value={draftMount.filename_mode}
+              onChange={(event) =>
+                setMount("filename_mode", event.target.value as MountSettings["filename_mode"])
+              }
+            >
+              <option value="date-original-id">Date original ID</option>
+              <option value="original">Original</option>
+              <option value="stable">Stable</option>
+            </select>
+          </PolicyField>
+        </PolicyTreeNode>
+
+        <PolicyTreeNode
+          icon={FolderTree}
+          label="Favorites"
+          path="/Favorites"
+          checked={draftMount.favorites_enabled}
+          onChange={(value) => setMount("favorites_enabled", value)}
+        />
+
+        <PolicyTreeNode
+          icon={FolderTree}
+          label="Views"
+          path="/Views"
+          checked={draftMount.views_enabled}
+          onChange={(value) => setMount("views_enabled", value)}
+        />
+
+        <PolicyTreeNode icon={Trash2} label="Permanent delete" path="destructive">
+          <PolicyToggle
+            icon={Trash2}
+            label="Asset deletion"
+            detail="Not implemented; album delete only removes membership"
+            checked={false}
+            disabled
+            danger
+            onChange={() => undefined}
+          />
+        </PolicyTreeNode>
       </div>
     </form>
   );
 }
 
-function ToggleGrid<T extends Record<string, unknown>>({
-  values,
-  draft,
+function PolicyTreeNode({
+  icon: Icon,
+  label,
+  path,
+  checked,
+  children,
   onChange
 }: {
-  values: Array<[keyof T, string]>;
-  draft: T;
-  onChange: (key: keyof T, value: boolean) => void;
+  icon: typeof FolderTree;
+  label: string;
+  path: string;
+  checked?: boolean;
+  children?: React.ReactNode;
+  onChange?: (value: boolean) => void;
 }) {
   return (
-    <div className="toggle-grid">
-      {values.map(([key, label]) => (
-        <label className="toggle-tile" key={String(key)}>
-          <input
-            type="checkbox"
-            checked={Boolean(draft[key])}
-            onChange={(event) => onChange(key, event.target.checked)}
-          />
-          <span>{label}</span>
-        </label>
-      ))}
+    <div className="policy-node">
+      <div className="policy-node-head">
+        <div className="policy-node-title">
+          <Icon size={17} />
+          <div>
+            <strong>{label}</strong>
+            <code>{path}</code>
+          </div>
+        </div>
+        {checked !== undefined && (
+          <label className="policy-switch">
+            <input
+              type="checkbox"
+              checked={checked}
+              onChange={(event) => onChange?.(event.target.checked)}
+            />
+            <span>{checked ? "mounted" : "hidden"}</span>
+          </label>
+        )}
+      </div>
+      {children && <div className="policy-children">{children}</div>}
     </div>
+  );
+}
+
+function PolicyToggle({
+  icon: Icon,
+  label,
+  detail,
+  checked,
+  disabled = false,
+  danger = false,
+  onChange
+}: {
+  icon: typeof FolderTree;
+  label: string;
+  detail: string;
+  checked: boolean;
+  disabled?: boolean;
+  danger?: boolean;
+  onChange: (value: boolean) => void;
+}) {
+  return (
+    <label className={danger ? "policy-control danger" : "policy-control"}>
+      <span className="policy-control-copy">
+        <Icon size={16} />
+        <span>
+          <strong>{label}</strong>
+          <em>{detail}</em>
+        </span>
+      </span>
+      <span className="policy-switch">
+        <input
+          type="checkbox"
+          checked={checked}
+          disabled={disabled}
+          onChange={(event) => onChange(event.target.checked)}
+        />
+        <span>{checked ? "on" : "off"}</span>
+      </span>
+    </label>
+  );
+}
+
+function PolicyField({
+  label,
+  detail,
+  children
+}: {
+  label: string;
+  detail: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <label className="policy-control field">
+      <span className="policy-control-copy">
+        <Database size={16} />
+        <span>
+          <strong>{label}</strong>
+          <em>{detail}</em>
+        </span>
+      </span>
+      <span className="policy-field-control">{children}</span>
+    </label>
   );
 }
 
@@ -1050,8 +1195,7 @@ function titleFor(section: Section) {
   return {
     overview: "Mount console",
     views: "Saved views",
-    mount: "Mount layout",
-    writes: "Write policy",
+    mount: "Filesystem policy",
     diagnostics: "Diagnostics"
   }[section];
 }

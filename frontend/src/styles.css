@@ -232,7 +232,8 @@ button:disabled {
 .login-header h1,
 .panel-title h2,
 .composer-header h2,
-.views-toolbar h2 {
+.views-toolbar h2,
+.policy-toolbar h2 {
   margin: 0;
   font-size: 19px;
   letter-spacing: 0;
@@ -763,6 +764,136 @@ select:focus {
   margin-right: auto;
 }
 
+.policy-panel {
+  gap: 16px;
+}
+
+.policy-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid var(--print-edge);
+  padding-bottom: 12px;
+}
+
+.policy-toolbar span {
+  color: var(--metadata);
+  font-size: 12px;
+}
+
+.policy-tree {
+  display: grid;
+  gap: 10px;
+}
+
+.policy-node {
+  border: 1px solid var(--print-edge);
+  border-radius: 8px;
+  background: rgba(244, 241, 234, 0.42);
+}
+
+.policy-node-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 48px;
+  padding: 10px 12px;
+}
+
+.policy-node-title,
+.policy-control-copy {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 10px;
+}
+
+.policy-node-title svg,
+.policy-control-copy svg {
+  flex: 0 0 auto;
+  color: var(--teal-signal);
+}
+
+.policy-node-title div,
+.policy-control-copy span {
+  display: grid;
+  min-width: 0;
+}
+
+.policy-node-title strong,
+.policy-control-copy strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--graphite);
+  font-size: 13px;
+}
+
+.policy-node-title code {
+  color: var(--metadata);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.policy-children {
+  display: grid;
+  gap: 7px;
+  border-left: 1px solid var(--print-edge);
+  margin: 0 12px 12px 24px;
+  padding-left: 12px;
+}
+
+.policy-control {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 44px;
+  gap: 12px;
+  border: 1px solid var(--print-edge);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: rgba(251, 250, 246, 0.68);
+}
+
+.policy-control.danger .policy-control-copy svg,
+.policy-control.danger .policy-control-copy strong {
+  color: var(--red-trash);
+}
+
+.policy-control-copy em {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--metadata);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 500;
+}
+
+.policy-switch {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-width: 94px;
+  gap: 8px;
+  color: var(--metadata);
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.policy-switch input {
+  width: 17px;
+  height: 17px;
+  min-height: 17px;
+  accent-color: var(--teal-signal);
+}
+
+.policy-field-control {
+  width: min(220px, 42%);
+}
+
 .toggle-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -807,7 +938,7 @@ select:focus {
   }
 
   .nav-list {
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     margin-top: 14px;
   }
 
@@ -855,5 +986,22 @@ select:focus {
 
   .row-actions {
     justify-content: flex-start;
+  }
+
+  .policy-toolbar,
+  .policy-node-head,
+  .policy-control {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .policy-switch,
+  .policy-field-control {
+    justify-content: flex-start;
+    width: 100%;
+  }
+
+  .policy-control-copy em {
+    white-space: normal;
   }
 }
