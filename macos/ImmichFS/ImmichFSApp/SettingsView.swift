@@ -5,14 +5,20 @@ final class AppState: ObservableObject {
     @Published var bridgeURLText: String
     @Published var username: String
     @Published var apiKeyInput = ""
+    @Published var shareURLInput = ""
+    @Published var connectionMode: BridgeAuthKind = .admin
+    @Published var isAddingBridge = false
     @Published var selectedSection: AdminSection = .overview
     @Published var mountSettings: MountSettings?
     @Published var writePolicy: WritePolicy?
+    @Published private(set) var profiles: [BridgeProfile]
+    @Published private(set) var selectedProfileID: UUID?
     @Published private(set) var session: AdminSession?
     @Published private(set) var diagnostics: Diagnostics?
     @Published private(set) var views: [SavedView] = []
     @Published private(set) var tags: [OptionItem] = []
     @Published private(set) var people: [OptionItem] = []
+    @Published private(set) var availableMounts: [BridgeMount] = []
     @Published private(set) var isLoading = false
     @Published private(set) var isSaving = false
     @Published private(set) var lastRefresh: Date?
@@ -24,25 +30,80 @@ final class AppState: ObservableObject {
     private let defaults = UserDefaults.standard
     private let bridgeURLKey = "ImmichBridgeAdminURL"
     private let usernameKey = "ImmichBridgeAdminUsername"
+    private let profilesKey = "ImmichBridgeProfilesV1"
+    private let selectedProfileKey = "ImmichBridgeSelectedProfileID"
 
     init() {
-        bridgeURLText = defaults.string(forKey: bridgeURLKey) ?? "http://localhost:8080"
-        username = defaults.string(forKey: usernameKey) ?? ""
+        let loadedProfiles = Self.loadProfiles(from: defaults, profilesKey: profilesKey)
+        let legacyBridgeURL = defaults.string(forKey: bridgeURLKey)
+        let legacyUsername = defaults.string(forKey: usernameKey)
+        let initialProfiles: [BridgeProfile]
+        if loadedProfiles.isEmpty, let legacyBridgeURL, !legacyBridgeURL.isEmpty {
+            initialProfiles = [
+                BridgeProfile(
+                    bridgeURL: legacyBridgeURL,
+                    displayName: URL(string: legacyBridgeURL)?.host ?? "Immich Bridge",
+                    authKind: .admin,
+                    username: legacyUsername
+                )
+            ]
+        } else {
+            initialProfiles = loadedProfiles
+        }
+
+        let initialSelectedProfileID: UUID?
+        if let selectedIDText = defaults.string(forKey: selectedProfileKey),
+           let selectedID = UUID(uuidString: selectedIDText),
+           initialProfiles.contains(where: { $0.id == selectedID }) {
+            initialSelectedProfileID = selectedID
+        } else {
+            initialSelectedProfileID = initialProfiles.first?.id
+        }
+
+        let selectedProfile = initialProfiles.first { $0.id == initialSelectedProfileID }
+        profiles = initialProfiles
+        selectedProfileID = initialSelectedProfileID
+        bridgeURLText = selectedProfile?.bridgeURL ?? legacyBridgeURL ?? ""
+        username = selectedProfile?.username ?? legacyUsername ?? ""
+        connectionMode = selectedProfile?.authKind ?? .admin
+    }
+
+    var activeProfile: BridgeProfile? {
+        profiles.first { $0.id == selectedProfileID }
     }
 
     var isAuthenticated: Bool {
         session?.authenticated == true
     }
 
+    var canManageBridge: Bool {
+        session?.isAdminCapable == true
+    }
+
+    var shouldShowConnectForm: Bool {
+        !isAuthenticated || isAddingBridge
+    }
+
+    var canConnect: Bool {
+        let hasBridge = !bridgeURLText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        switch connectionMode {
+        case .admin:
+            return hasBridge && !apiKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .share:
+            return hasBridge && !shareURLInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
     var displayUser: String {
-        session?.user?.name ?? session?.user?.email ?? username
+        session?.displayName ?? activeProfile?.principalName ?? activeProfile?.displayName ?? username
     }
 
     var statusText: String {
         if isAuthenticated {
-            return "Connected to Immich Bridge as \(displayUser)"
+            let host = activeProfile?.hostLabel ?? URL(string: bridgeURLText)?.host ?? "Immich Bridge"
+            return "Connected to \(host) as \(displayUser)"
         }
-        return "Immich Bridge admin is not connected"
+        return "Immich Bridge is not connected"
     }
 
     var menuBarSymbol: String {
@@ -57,7 +118,47 @@ final class AppState: ObservableObject {
         await restoreSession()
     }
 
+    func connect() async {
+        switch connectionMode {
+        case .admin:
+            await connectAdmin()
+        case .share:
+            await connectShare()
+        }
+    }
+
     func signIn() async {
+        await connect()
+    }
+
+    func beginAddBridge() {
+        isAddingBridge = true
+        errorMessage = nil
+        bridgeURLText = ""
+        username = ""
+        apiKeyInput = ""
+        shareURLInput = ""
+        connectionMode = .admin
+    }
+
+    func cancelAddBridge() {
+        isAddingBridge = false
+        errorMessage = nil
+        applyActiveProfileToInputs()
+    }
+
+    func activateProfile(_ profile: BridgeProfile) async {
+        guard selectedProfileID != profile.id else {
+            return
+        }
+        selectedProfileID = profile.id
+        defaults.set(profile.id.uuidString, forKey: selectedProfileKey)
+        clearRuntimeState(keepSession: false)
+        applyActiveProfileToInputs()
+        await restoreSession()
+    }
+
+    private func connectAdmin() async {
         errorMessage = nil
         isLoading = true
         defer { isLoading = false }
@@ -70,15 +171,47 @@ final class AppState: ObservableObject {
                 throw AdminAPIError.emptyResponse
             }
 
-            api = client
-            session = currentSession
-            storedApiKey = apiKeyInput
-            defaults.set(bridgeURL.absoluteString, forKey: bridgeURLKey)
-            defaults.set(username, forKey: usernameKey)
-            try KeychainStore.save(apiKeyInput, account: .adminApiKey)
-            try KeychainStore.save(token, account: .sessionToken)
+            let apiKey = apiKeyInput
+            try await finishConnection(
+                client: client,
+                currentSession: currentSession,
+                bridgeURL: bridgeURL,
+                authKind: .admin,
+                username: username,
+                sessionToken: token,
+                secret: apiKey
+            )
+            storedApiKey = apiKey
             apiKeyInput = ""
-            await refreshAll(setLoading: false)
+        } catch {
+            errorMessage = message(from: error)
+        }
+    }
+
+    private func connectShare() async {
+        errorMessage = nil
+        isLoading = true
+        defer { isLoading = false }
+
+        do {
+            let bridgeURL = try normalizedBridgeURL(from: bridgeURLText)
+            let client = AdminAPI(baseURL: bridgeURL)
+            let currentSession = try await client.shareLogin(shareURL: shareURLInput)
+            guard let token = currentSession.sessionToken else {
+                throw AdminAPIError.emptyResponse
+            }
+
+            let shareURL = shareURLInput
+            try await finishConnection(
+                client: client,
+                currentSession: currentSession,
+                bridgeURL: bridgeURL,
+                authKind: .share,
+                username: nil,
+                sessionToken: token,
+                secret: shareURL
+            )
+            shareURLInput = ""
         } catch {
             errorMessage = message(from: error)
         }
@@ -87,20 +220,15 @@ final class AppState: ObservableObject {
     func signOut() async {
         errorMessage = nil
         if let api {
-            try? await api.logout()
+            try? await api.logoutCurrentSession()
         }
-        try? KeychainStore.delete(account: .adminApiKey)
-        try? KeychainStore.delete(account: .sessionToken)
-        api = nil
-        storedApiKey = nil
-        session = nil
-        diagnostics = nil
-        mountSettings = nil
-        writePolicy = nil
-        views = []
-        tags = []
-        people = []
-        lastRefresh = nil
+        if let profile = activeProfile {
+            try? KeychainStore.delete(accountName: sessionTokenAccount(for: profile.id))
+            try? KeychainStore.delete(accountName: adminApiKeyAccount(for: profile.id))
+            try? KeychainStore.delete(accountName: shareURLAccount(for: profile.id))
+        }
+        clearRuntimeState(keepSession: false)
+        applyActiveProfileToInputs()
     }
 
     func refreshAll(setLoading: Bool = true, retried: Bool = false) async {
@@ -118,6 +246,23 @@ final class AppState: ObservableObject {
         }
 
         do {
+            let currentSession = try await api.currentPrincipal()
+            let mounts = try await loadMounts(for: currentSession, using: api)
+            session = currentSession
+            availableMounts = mounts
+            updateActiveProfile(session: currentSession, mounts: mounts)
+
+            guard currentSession.isAdminCapable else {
+                diagnostics = nil
+                mountSettings = nil
+                writePolicy = nil
+                views = []
+                tags = []
+                people = []
+                lastRefresh = Date()
+                return
+            }
+
             async let diagnosticsTask = api.diagnostics()
             async let mountTask = api.mountSettings()
             async let policyTask = api.writePolicy()
@@ -259,25 +404,35 @@ final class AppState: ObservableObject {
     }
 
     private func restoreSession() async {
+        guard let profile = activeProfile else {
+            applyActiveProfileToInputs()
+            return
+        }
+
         isLoading = true
         defer { isLoading = false }
 
         do {
-            storedApiKey = try KeychainStore.read(account: .adminApiKey)
-            let token = try KeychainStore.read(account: .sessionToken)
-            let bridgeURL = try normalizedBridgeURL(from: bridgeURLText)
+            applyActiveProfileToInputs()
+            if profile.authKind == .admin {
+                storedApiKey = try KeychainStore.read(accountName: adminApiKeyAccount(for: profile.id))
+                    ?? KeychainStore.read(account: .adminApiKey)
+            }
+            let token = try KeychainStore.read(accountName: sessionTokenAccount(for: profile.id))
+                ?? KeychainStore.read(account: .sessionToken)
+            let bridgeURL = try normalizedBridgeURL(from: profile.bridgeURL)
             let client = AdminAPI(baseURL: bridgeURL, sessionToken: token)
             api = client
 
             if let token, !token.isEmpty {
                 do {
-                    session = try await client.sessionStatus()
+                    session = try await client.currentPrincipal()
                     await refreshAll(setLoading: false)
                 } catch {
                     if isUnauthorized(error), await reauthenticate() {
                         await refreshAll(setLoading: false)
                     } else {
-                        session = nil
+                        clearRuntimeState(keepSession: false)
                     }
                 }
                 return
@@ -292,19 +447,46 @@ final class AppState: ObservableObject {
     }
 
     private func reauthenticate() async -> Bool {
-        guard let storedApiKey, !storedApiKey.isEmpty else {
+        guard let profile = activeProfile else {
             return false
         }
         do {
-            let bridgeURL = try normalizedBridgeURL(from: bridgeURLText)
+            let bridgeURL = try normalizedBridgeURL(from: profile.bridgeURL)
             let client = AdminAPI(baseURL: bridgeURL)
-            let currentSession = try await client.login(username: username, apiKey: storedApiKey)
+            let currentSession: AdminSession
+            let secret: String
+            switch profile.authKind {
+            case .admin:
+                let profileApiKey = try KeychainStore.read(accountName: adminApiKeyAccount(for: profile.id))
+                let legacyApiKey = try KeychainStore.read(account: .adminApiKey)
+                let apiKey = storedApiKey ?? profileApiKey ?? legacyApiKey
+                guard let apiKey, !apiKey.isEmpty else {
+                    return false
+                }
+                currentSession = try await client.login(username: profile.username ?? username, apiKey: apiKey)
+                secret = apiKey
+                storedApiKey = apiKey
+            case .share:
+                guard let shareURL = try KeychainStore.read(accountName: shareURLAccount(for: profile.id)),
+                      !shareURL.isEmpty else {
+                    return false
+                }
+                currentSession = try await client.shareLogin(shareURL: shareURL)
+                secret = shareURL
+            }
             guard let token = currentSession.sessionToken else {
                 throw AdminAPIError.emptyResponse
             }
-            api = client
-            session = currentSession
-            try KeychainStore.save(token, account: .sessionToken)
+            try await finishConnection(
+                client: client,
+                currentSession: currentSession,
+                bridgeURL: bridgeURL,
+                authKind: profile.authKind,
+                username: profile.username,
+                sessionToken: token,
+                secret: secret,
+                refreshAdminState: false
+            )
             return true
         } catch {
             return false
@@ -316,7 +498,10 @@ final class AppState: ObservableObject {
         guard !trimmed.isEmpty else {
             throw AdminAPIError.invalidBridgeURL
         }
-        let value = trimmed.contains("://") ? trimmed : "http://\(trimmed)"
+        var value = trimmed.contains("://") ? trimmed : "https://\(trimmed)"
+        while value.hasSuffix("/") {
+            value.removeLast()
+        }
         guard let url = URL(string: value), url.scheme != nil, url.host != nil else {
             throw AdminAPIError.invalidBridgeURL
         }
@@ -332,6 +517,240 @@ final class AppState: ObservableObject {
             return description
         }
         return error.localizedDescription
+    }
+
+    private func loadMounts(for currentSession: AdminSession, using client: AdminAPI) async throws -> [BridgeMount] {
+        let mounts = try await client.availableMounts()
+        if !mounts.isEmpty || !currentSession.isAdminCapable {
+            return mounts
+        }
+
+        let libraries = (try? await client.libraries()) ?? []
+        if !libraries.isEmpty {
+            let capabilities = mountCapabilities(for: currentSession)
+            return libraries.map { library in
+                BridgeMount(
+                    id: "library:\(library.id)",
+                    kind: "library",
+                    libraryId: library.id,
+                    libraryName: library.name,
+                    displayName: library.name,
+                    scope: "library",
+                    capabilities: capabilities
+                )
+            }
+        }
+
+        return fallbackMounts(for: currentSession)
+    }
+
+    private func fallbackMounts(for currentSession: AdminSession) -> [BridgeMount] {
+        guard currentSession.isAdminCapable else {
+            return []
+        }
+        let libraryID = currentSession.grants.first { $0.scope == "library" }?.libraryId ?? "default"
+        let displayName = libraryID == "default" ? "Immich Library" : libraryID
+        return [
+            BridgeMount(
+                id: "library:\(libraryID)",
+                kind: "library",
+                libraryId: libraryID,
+                libraryName: displayName,
+                displayName: displayName,
+                scope: "library",
+                capabilities: mountCapabilities(for: currentSession)
+            )
+        ]
+    }
+
+    private func mountCapabilities(for currentSession: AdminSession) -> [String] {
+        let capabilities = Set(currentSession.grants.flatMap(\.capabilities))
+        if !capabilities.isEmpty {
+            return Array(capabilities).sorted()
+        }
+        return [
+            "browse",
+            "download",
+            "thumbnail",
+            "upload",
+            "manage_views",
+            "manage_policy",
+            "manage_library",
+            "diagnostics",
+        ]
+    }
+
+    private func finishConnection(
+        client: AdminAPI,
+        currentSession: AdminSession,
+        bridgeURL: URL,
+        authKind: BridgeAuthKind,
+        username: String?,
+        sessionToken: String,
+        secret: String,
+        refreshAdminState: Bool = true
+    ) async throws {
+        api = client
+        session = currentSession
+        availableMounts = try await loadMounts(for: currentSession, using: client)
+
+        let profile = upsertProfile(
+            bridgeURL: bridgeURL,
+            authKind: authKind,
+            username: username,
+            session: currentSession,
+            mounts: availableMounts
+        )
+        selectedProfileID = profile.id
+        defaults.set(profile.id.uuidString, forKey: selectedProfileKey)
+        defaults.set(bridgeURL.absoluteString, forKey: bridgeURLKey)
+        if let username {
+            defaults.set(username, forKey: usernameKey)
+        }
+        try KeychainStore.save(sessionToken, accountName: sessionTokenAccount(for: profile.id))
+        switch authKind {
+        case .admin:
+            try KeychainStore.save(secret, accountName: adminApiKeyAccount(for: profile.id))
+        case .share:
+            try KeychainStore.save(secret, accountName: shareURLAccount(for: profile.id))
+        }
+        isAddingBridge = false
+        lastRefresh = Date()
+
+        if refreshAdminState, currentSession.isAdminCapable {
+            await refreshAll(setLoading: false)
+        } else if !currentSession.isAdminCapable {
+            diagnostics = nil
+            mountSettings = nil
+            writePolicy = nil
+            views = []
+            tags = []
+            people = []
+        }
+    }
+
+    private func upsertProfile(
+        bridgeURL: URL,
+        authKind: BridgeAuthKind,
+        username: String?,
+        session: AdminSession,
+        mounts: [BridgeMount]
+    ) -> BridgeProfile {
+        let principalName = session.displayName
+        let displayName = mounts.first?.libraryName
+            ?? session.principal?.displayName
+            ?? bridgeURL.host
+            ?? "Immich Bridge"
+        let principalKind = session.principal?.kind
+        let targetIndex = profiles.firstIndex { profile in
+            if !isAddingBridge, profile.id == selectedProfileID {
+                return true
+            }
+            return profile.bridgeURL == bridgeURL.absoluteString
+                && profile.authKind == authKind
+                && profile.username == username
+                && profile.principalKind == principalKind
+                && profile.principalName == principalName
+        }
+
+        if let targetIndex {
+            profiles[targetIndex].bridgeURL = bridgeURL.absoluteString
+            profiles[targetIndex].displayName = displayName
+            profiles[targetIndex].authKind = authKind
+            profiles[targetIndex].username = username
+            profiles[targetIndex].principalKind = principalKind
+            profiles[targetIndex].principalName = principalName
+            profiles[targetIndex].mounts = mounts
+            profiles[targetIndex].sessionExpiresAt = session.expiresAt
+            profiles[targetIndex].lastConnectedAt = Date()
+            saveProfiles()
+            return profiles[targetIndex]
+        }
+
+        let profile = BridgeProfile(
+            bridgeURL: bridgeURL.absoluteString,
+            displayName: displayName,
+            authKind: authKind,
+            username: username,
+            principalKind: principalKind,
+            principalName: principalName,
+            mounts: mounts,
+            sessionExpiresAt: session.expiresAt,
+            lastConnectedAt: Date()
+        )
+        profiles.append(profile)
+        saveProfiles()
+        return profile
+    }
+
+    private func updateActiveProfile(session: AdminSession, mounts: [BridgeMount]) {
+        guard let index = profiles.firstIndex(where: { $0.id == selectedProfileID }) else {
+            return
+        }
+        profiles[index].principalKind = session.principal?.kind
+        profiles[index].principalName = session.displayName
+        profiles[index].mounts = mounts
+        profiles[index].sessionExpiresAt = session.expiresAt
+        profiles[index].lastConnectedAt = Date()
+        saveProfiles()
+    }
+
+    private func clearRuntimeState(keepSession: Bool) {
+        api = nil
+        storedApiKey = nil
+        if !keepSession {
+            session = nil
+        }
+        diagnostics = nil
+        mountSettings = nil
+        writePolicy = nil
+        views = []
+        tags = []
+        people = []
+        availableMounts = []
+        lastRefresh = nil
+    }
+
+    private func applyActiveProfileToInputs() {
+        guard let profile = activeProfile else {
+            bridgeURLText = ""
+            username = ""
+            connectionMode = .admin
+            apiKeyInput = ""
+            shareURLInput = ""
+            return
+        }
+        bridgeURLText = profile.bridgeURL
+        username = profile.username ?? ""
+        connectionMode = profile.authKind
+        apiKeyInput = ""
+        shareURLInput = ""
+    }
+
+    private func saveProfiles() {
+        guard let data = try? JSONEncoder().encode(profiles) else {
+            return
+        }
+        defaults.set(data, forKey: profilesKey)
+    }
+
+    private static func loadProfiles(from defaults: UserDefaults, profilesKey: String) -> [BridgeProfile] {
+        guard let data = defaults.data(forKey: profilesKey) else {
+            return []
+        }
+        return (try? JSONDecoder().decode([BridgeProfile].self, from: data)) ?? []
+    }
+
+    private func sessionTokenAccount(for profileID: UUID) -> String {
+        "profile.\(profileID.uuidString).session-token"
+    }
+
+    private func adminApiKeyAccount(for profileID: UUID) -> String {
+        "profile.\(profileID.uuidString).admin-api-key"
+    }
+
+    private func shareURLAccount(for profileID: UUID) -> String {
+        "profile.\(profileID.uuidString).share-url"
     }
 }
 
@@ -367,8 +786,10 @@ struct SettingsView: View {
 
     var body: some View {
         Group {
-            if state.isAuthenticated {
+            if state.isAuthenticated, state.canManageBridge {
                 AdminConsoleView(state: state)
+            } else if state.isAuthenticated {
+                ViewerSettingsView(state: state)
             } else {
                 LoginView(state: state)
             }
@@ -387,17 +808,30 @@ private struct LoginView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Immich Bridge")
                     .font(.largeTitle.weight(.semibold))
-                Text("Connect to the admin API with an Immich admin API key.")
+                Text("Connect with an Immich admin API key or an Immich shared link.")
                     .foregroundStyle(.secondary)
             }
 
             Form {
-                TextField("Bridge admin URL", text: $state.bridgeURLText)
+                Picker("Access", selection: $state.connectionMode) {
+                    ForEach(BridgeAuthKind.allCases) { mode in
+                        Label(mode.label, systemImage: mode.systemImage).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                TextField("Bridge URL", text: $state.bridgeURLText)
                     .textContentType(.URL)
-                TextField("Immich username or email", text: $state.username)
-                    .textContentType(.username)
-                SecureField("Immich API key", text: $state.apiKeyInput)
-                    .textContentType(.password)
+
+                if state.connectionMode == .admin {
+                    TextField("Immich username or email", text: $state.username)
+                        .textContentType(.username)
+                    SecureField("Immich API key or superadmin password", text: $state.apiKeyInput)
+                        .textContentType(.password)
+                } else {
+                    TextField("Immich share URL", text: $state.shareURLInput)
+                        .textContentType(.URL)
+                }
             }
             .formStyle(.grouped)
 
@@ -414,7 +848,7 @@ private struct LoginView: View {
                     Label(state.isLoading ? "Connecting" : "Connect", systemImage: "key")
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(state.isLoading || state.bridgeURLText.isEmpty || state.apiKeyInput.isEmpty)
+                .disabled(state.isLoading || !state.canConnect)
 
                 if state.isLoading {
                     ProgressView()
@@ -426,6 +860,50 @@ private struct LoginView: View {
         }
         .padding(32)
         .frame(minWidth: 620, minHeight: 420)
+    }
+}
+
+private struct ViewerSettingsView: View {
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HeaderView(state: state)
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    if let errorMessage = state.errorMessage {
+                        ErrorBanner(message: errorMessage)
+                    }
+
+                    GroupBox("Access") {
+                        Grid(alignment: .leading, horizontalSpacing: 28, verticalSpacing: 10) {
+                            InfoRow("Bridge", state.activeProfile?.hostLabel ?? state.bridgeURLText)
+                            InfoRow("Role", state.session?.principal?.roleLabel ?? "Viewer")
+                            InfoRow("User", state.displayUser)
+                            InfoRow("Expires", state.session?.expiresAt ?? "-")
+                        }
+                        .padding(6)
+                    }
+
+                    MountsGroup(mounts: state.availableMounts)
+
+                    GroupBox("Settings") {
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: "lock")
+                                .foregroundStyle(.secondary)
+                            Text("This login can browse the mounts listed above. Bridge configuration is available only to superadmins and Immich library admins.")
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        }
+                        .padding(6)
+                    }
+                }
+                .padding(22)
+            }
+        }
+        .frame(minWidth: 720, minHeight: 520)
     }
 }
 
@@ -802,12 +1280,12 @@ private struct PolicyPanel: View {
             .padding(22)
         }
         .onAppear(perform: syncDrafts)
-        .onChange(of: state.mountSettings) { _ in
+        .onChange(of: state.mountSettings) { _, _ in
             if draftMount == nil {
                 syncDrafts()
             }
         }
-        .onChange(of: state.writePolicy) { _ in
+        .onChange(of: state.writePolicy) { _, _ in
             if draftPolicy == nil {
                 syncDrafts()
             }
@@ -1222,6 +1700,58 @@ private struct MountLine: View {
             Label(name, systemImage: enabled ? "folder" : "folder.badge.minus")
             Spacer()
             StatusPill(text: enabled ? "visible" : "hidden", isActive: enabled)
+        }
+    }
+}
+
+private struct MountsGroup: View {
+    var mounts: [BridgeMount]
+
+    var body: some View {
+        GroupBox("Available mounts") {
+            if mounts.isEmpty {
+                HStack(spacing: 10) {
+                    Image(systemName: "externaldrive.badge.questionmark")
+                        .foregroundStyle(.secondary)
+                    Text("No mounts are available for this login.")
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(6)
+            } else {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(mounts) { mount in
+                        MountAccessLine(mount: mount)
+                    }
+                }
+                .padding(6)
+            }
+        }
+    }
+}
+
+private struct MountAccessLine: View {
+    var mount: BridgeMount
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: mount.kind == "share" ? "link" : "externaldrive")
+                .frame(width: 20)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(mount.displayName)
+                    .font(.body.weight(.medium))
+                HStack(spacing: 8) {
+                    Text(mount.kindLabel)
+                    if let assetCountLabel = mount.assetCountLabel {
+                        Text(assetCountLabel)
+                    }
+                    Text(mount.canUpload ? "uploads allowed" : "read-only")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            Spacer()
+            StatusPill(text: "not mounted", isActive: false)
         }
     }
 }

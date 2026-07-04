@@ -1,5 +1,6 @@
 """Tests for admin API sessions and configuration."""
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -7,7 +8,7 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from immich_bridge.admin_store import get_admin_store
-from immich_bridge.api.admin import SESSION_COOKIE
+from immich_bridge.api.admin import SESSION_COOKIE, _token_hash
 from immich_bridge.app import create_app
 from immich_bridge.authz import verify_grants_token
 from immich_bridge.config import Settings, get_settings
@@ -138,6 +139,97 @@ def test_admin_libraries_are_discovered_from_session_grants(tmp_path: Path) -> N
 
     assert response.status_code == 200
     assert [library["id"] for library in response.json()["libraries"]] == ["default", "work"]
+
+
+def test_library_admin_gets_default_library_mount(tmp_path: Path) -> None:
+    """A library admin should see the library content as a mount."""
+    client = make_client(tmp_path)
+    token = login(client)
+
+    response = client.get("/api/me/mounts", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 200
+    assert response.json()["mounts"] == [
+        {
+            "id": "library:default",
+            "kind": "library",
+            "library_id": "default",
+            "library_name": "Default Library",
+            "display_name": "Default Library",
+            "scope": "library",
+            "capabilities": [
+                "browse",
+                "download",
+                "thumbnail",
+                "upload",
+                "manage_views",
+                "manage_policy",
+                "manage_library",
+                "diagnostics",
+            ],
+            "share_id": None,
+            "asset_count": None,
+            "expires_at": None,
+        }
+    ]
+
+
+def test_superadmin_gets_one_mount_per_library(tmp_path: Path) -> None:
+    """Superadmins should see every configured Immich library as a mount."""
+    client = make_client(tmp_path, superadmin_password="secret")
+    store = get_admin_store(f"sqlite:///{tmp_path / 'bridge.db'}")
+    store.ensure_default_library("http://immich.test/api")
+    store.upsert_library(
+        {
+            "id": "work",
+            "name": "Work Photos",
+            "immich_url": "http://work-immich.test/api",
+            "is_default": False,
+        }
+    )
+    token = superadmin_login(client)
+
+    response = client.get("/api/me/mounts", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 200
+    assert [mount["id"] for mount in response.json()["mounts"]] == [
+        "library:default",
+        "library:work",
+    ]
+    assert [mount["display_name"] for mount in response.json()["mounts"]] == [
+        "Default Library",
+        "Work Photos",
+    ]
+
+
+def test_legacy_admin_session_without_grants_gets_default_mount(tmp_path: Path) -> None:
+    """Older admin sessions without stored grants should still expose the default mount."""
+    client = make_client(tmp_path)
+    store = get_admin_store(f"sqlite:///{tmp_path / 'bridge.db'}")
+    token = "legacy-token"
+    now = datetime.now(UTC)
+    store.create_session(
+        {
+            "token_hash": _token_hash(token),
+            "principal_id": "user-1",
+            "principal_kind": "library_admin",
+            "user_id": "user-1",
+            "email": "barry@example.com",
+            "name": "Barry",
+            "api_key_name": "admin-ui",
+            "created_at": now.isoformat(),
+            "expires_at": (now + timedelta(hours=1)).isoformat(),
+            "last_seen_at": now.isoformat(),
+        }
+    )
+
+    mounts_response = client.get("/api/me/mounts", headers={"Authorization": f"Bearer {token}"})
+    me_response = client.get("/api/me", headers={"Authorization": f"Bearer {token}"})
+
+    assert mounts_response.status_code == 200
+    assert [mount["id"] for mount in mounts_response.json()["mounts"]] == ["library:default"]
+    assert me_response.status_code == 200
+    assert me_response.json()["grants"][0]["library_id"] == "default"
 
 
 def test_superadmin_can_create_and_update_libraries(tmp_path: Path) -> None:

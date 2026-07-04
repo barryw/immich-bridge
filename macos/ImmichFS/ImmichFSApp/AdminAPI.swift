@@ -9,7 +9,7 @@ enum AdminAPIError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidBridgeURL:
-            "Enter a valid Immich Bridge admin URL."
+            "Enter a valid Immich Bridge URL."
         case .emptyResponse:
             "The bridge returned an empty response."
         case let .unauthorized(message):
@@ -55,12 +55,41 @@ final class AdminAPI {
         return response
     }
 
+    func shareLogin(shareURL: String) async throws -> AdminSession {
+        let response: AdminSession = try await send(
+            "/api/auth/share-link",
+            method: "POST",
+            body: ShareLoginRequest(shareUrl: shareURL)
+        )
+        sessionToken = response.sessionToken
+        return response
+    }
+
     func sessionStatus() async throws -> AdminSession {
         try await send("/api/admin/session")
     }
 
+    func currentPrincipal() async throws -> AdminSession {
+        try await send("/api/me")
+    }
+
+    func availableMounts() async throws -> [BridgeMount] {
+        let response: MountsResponse = try await send("/api/me/mounts")
+        return response.mounts
+    }
+
+    func libraries() async throws -> [BridgeLibrary] {
+        let response: LibrariesResponse = try await send("/api/admin/libraries")
+        return response.libraries
+    }
+
     func logout() async throws {
         let _: EmptyResponse = try await send("/api/admin/session", method: "DELETE")
+        sessionToken = nil
+    }
+
+    func logoutCurrentSession() async throws {
+        let _: EmptyResponse = try await send("/api/auth/session", method: "DELETE")
         sessionToken = nil
     }
 

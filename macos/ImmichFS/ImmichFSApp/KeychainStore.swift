@@ -21,8 +21,12 @@ enum KeychainStore {
     private static let service = "io.immichbridge.ImmichFS"
 
     static func save(_ value: String, account: Account) throws {
+        try save(value, accountName: account.rawValue)
+    }
+
+    static func save(_ value: String, accountName: String) throws {
         let data = Data(value.utf8)
-        var query = baseQuery(account: account)
+        var query = baseQuery(accountName: accountName)
         SecItemDelete(query as CFDictionary)
 
         query[kSecValueData as String] = data
@@ -35,7 +39,11 @@ enum KeychainStore {
     }
 
     static func read(account: Account) throws -> String? {
-        var query = baseQuery(account: account)
+        try read(accountName: account.rawValue)
+    }
+
+    static func read(accountName: String) throws -> String? {
+        var query = baseQuery(accountName: accountName)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
 
@@ -54,7 +62,11 @@ enum KeychainStore {
     }
 
     static func delete(account: Account) throws {
-        let status = SecItemDelete(baseQuery(account: account) as CFDictionary)
+        try delete(accountName: account.rawValue)
+    }
+
+    static func delete(accountName: String) throws {
+        let status = SecItemDelete(baseQuery(accountName: accountName) as CFDictionary)
         if status == errSecItemNotFound {
             return
         }
@@ -63,11 +75,11 @@ enum KeychainStore {
         }
     }
 
-    private static func baseQuery(account: Account) -> [String: Any] {
+    private static func baseQuery(accountName: String) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: account.rawValue
+            kSecAttrAccount as String: accountName
         ]
     }
 }

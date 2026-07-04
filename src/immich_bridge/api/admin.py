@@ -366,9 +366,17 @@ def _grant_signing_secret(settings: Settings) -> str:
 
 def _grants_from_session(session: dict[str, Any]) -> list[dict[str, Any]]:
     grants = session.get("grants")
-    if not isinstance(grants, list):
-        return []
-    return [grant for grant in grants if isinstance(grant, dict)]
+    if isinstance(grants, list):
+        cleaned = [grant for grant in grants if isinstance(grant, dict)]
+        if cleaned:
+            return cleaned
+
+    principal_kind = str(session.get("principal_kind") or "")
+    if principal_kind == "superadmin":
+        return [superadmin_grant()]
+    if principal_kind in {"immich_admin", "library_admin"}:
+        return [library_admin_grant(DEFAULT_LIBRARY_ID)]
+    return []
 
 
 def _library_response(library: dict[str, Any]) -> LibraryResponse:
