@@ -314,6 +314,44 @@ def test_search_assets_sends_query_and_geography_filters() -> None:
     }
 
 
+def test_count_assets_uses_search_statistics() -> None:
+    """Asset counts should use Immich's statistics endpoint, not search pagination totals."""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"total": 1234})
+
+    client = ImmichClient(
+        base_url="http://immich.test/api",
+        api_key="api-key",
+        user_scope="user-1",
+    )
+    client._http_client.close()
+    client._http_client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    with patch("immich_bridge.immich_client.get_cache") as mock_get_cache:
+        mock_get_cache.return_value.get_json.return_value = None
+        count = client.count_assets(
+            query="beach",
+            city="Los Angeles",
+            state="California",
+            country="USA",
+        )
+
+    client.close()
+
+    assert count == 1234
+    assert len(requests) == 1
+    assert requests[0].url.path == "/api/search/statistics"
+    assert json.loads(requests[0].content) == {
+        "query": "beach",
+        "city": "Los Angeles",
+        "state": "California",
+        "country": "USA",
+    }
+
+
 def test_upload_asset_sends_multipart_and_returns_asset_id(tmp_path) -> None:
     """Asset uploads should use Immich multipart API without retrying."""
     upload_file = tmp_path / "IMG_0001.jpg"

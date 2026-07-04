@@ -558,8 +558,34 @@ select:focus {
 
 .count-pill {
   display: grid;
+  min-height: 42px;
   justify-items: end;
+  align-content: center;
   line-height: 1.1;
+}
+
+.count-button {
+  width: 100%;
+  border: 0;
+  padding: 0;
+  background: transparent;
+}
+
+.count-button:hover {
+  color: var(--teal-signal);
+}
+
+.count-pill.loading {
+  color: var(--metadata);
+}
+
+.count-pill svg {
+  justify-self: end;
+}
+
+.count-spinner {
+  color: var(--teal-signal);
+  animation: count-spin 0.8s linear infinite;
 }
 
 .count-pill strong {
@@ -756,6 +782,12 @@ select:focus {
 
 .preview-panel > svg {
   color: var(--teal-signal);
+}
+
+@keyframes count-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .preview-panel div {

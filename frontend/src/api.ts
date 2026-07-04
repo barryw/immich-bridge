@@ -143,7 +143,10 @@ export const api = {
     }),
   session: () => request<AdminSession>("/api/admin/session"),
   logout: () => request<void>("/api/admin/session", { method: "DELETE" }),
-  views: () => request<{ views: SavedView[] }>("/api/admin/views"),
+  views: (includeCounts = false) =>
+    request<{ views: SavedView[] }>(
+      `/api/admin/views?include_counts=${includeCounts ? "true" : "false"}`
+    ),
   createView: (view: SavedViewPayload) =>
     request<SavedView>("/api/admin/views", {
       method: "POST",

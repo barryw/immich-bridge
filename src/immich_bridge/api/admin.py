@@ -11,7 +11,7 @@ from threading import Lock
 from typing import Annotated, Any, Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Response
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
@@ -380,16 +380,24 @@ async def list_views(
     settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[AdminStore, Depends(_store)],
     admin: Annotated[AdminContext | None, Depends(optional_admin_context)],
+    include_counts: Annotated[
+        bool,
+        Query(description="Include Immich-backed match counts for each saved view."),
+    ] = True,
 ) -> ViewsResponse:
     """List saved DAV views."""
     return ViewsResponse(
         views=[
             _view_response(
                 view,
-                match_count=_optional_count_matching_assets(
-                    settings,
-                    admin,
-                    view.get("filters") or {},
+                match_count=(
+                    _optional_count_matching_assets(
+                        settings,
+                        admin,
+                        view.get("filters") or {},
+                    )
+                    if include_counts
+                    else None
                 ),
             )
             for view in store.list_views()
@@ -614,13 +622,44 @@ def _count_matching_assets(
 ) -> int | None:
     client = _admin_immich_client(settings, admin)
     try:
-        page = client.search_assets(
-            page=1,
-            size=1,
-            with_exif=False,
-            **_search_kwargs_from_filters(filters),
+        search_kwargs = _search_kwargs_from_filters(filters)
+        try:
+            return client.count_assets(**search_kwargs)
+        except ImmichApiError as e:
+            logger.warning(
+                "admin_view_match_count_statistics_failed_using_paged_fallback",
+                error=str(e),
+                status_code=e.status_code,
+            )
+
+        count = 0
+        page_number = 1
+        next_page: str | None = None
+        while page_number <= settings.search_max_pages:
+            page = client.search_assets(
+                page=page_number,
+                size=settings.search_page_size,
+                with_exif=False,
+                **search_kwargs,
+            )
+            count += len(page.items)
+            next_page = page.next_page
+            if not next_page:
+                return count
+
+            try:
+                page_number = int(next_page)
+            except ValueError:
+                logger.warning("admin_view_match_count_invalid_next_page", next_page=next_page)
+                return None
+
+        logger.warning(
+            "admin_view_match_count_truncated",
+            search_max_pages=settings.search_max_pages,
+            search_page_size=settings.search_page_size,
+            next_page=next_page,
         )
-        return page.total if page.total is not None else len(page.items)
+        return None
     except ImmichApiError as e:
         logger.warning("admin_view_match_count_failed", error=str(e), status_code=e.status_code)
         return None

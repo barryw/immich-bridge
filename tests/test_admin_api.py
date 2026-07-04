@@ -10,6 +10,7 @@ from immich_bridge.api.admin import SESSION_COOKIE
 from immich_bridge.app import create_app
 from immich_bridge.config import Settings, get_settings
 from immich_bridge.immich_auth import ImmichIdentity
+from immich_bridge.immich_client import ImmichApiError, SearchPage
 
 
 def make_client(tmp_path: Path) -> TestClient:
@@ -125,6 +126,12 @@ def test_admin_views_crud_and_diagnostics(tmp_path: Path) -> None:
     assert list_response.json()["views"][0]["name"] == "Kids"
     assert list_response.json()["views"][0]["match_count"] == 12
 
+    with patch("immich_bridge.api.admin._count_matching_assets") as count_assets:
+        fast_list_response = client.get("/api/admin/views?include_counts=false")
+    assert fast_list_response.status_code == 200
+    assert fast_list_response.json()["views"][0]["match_count"] is None
+    count_assets.assert_not_called()
+
     with patch("immich_bridge.api.admin._count_matching_assets", return_value=4):
         update_response = client.put(
             f"/api/admin/views/{view_id}",
@@ -231,8 +238,7 @@ def test_admin_options_and_match_count_use_immich_api(tmp_path: Path) -> None:
             {"id": "tag-1", "name": "Family", "color": "#00aa99", "assetCount": 5}
         ]
         instance.list_people.return_value = [{"id": "person-1", "name": "Alice", "assetCount": 7}]
-        instance.search_assets.return_value.total = 11
-        instance.search_assets.return_value.items = []
+        instance.count_assets.return_value = 11
 
         tags = client.get("/api/admin/options/tags")
         people = client.get("/api/admin/options/people")
@@ -264,8 +270,56 @@ def test_admin_options_and_match_count_use_immich_api(tmp_path: Path) -> None:
     assert people.json()["items"][0]["name"] == "Alice"
     assert count.status_code == 200
     assert count.json()["count"] == 11
-    instance.search_assets.assert_called_once()
-    assert instance.search_assets.call_args.kwargs["query"] == "beach"
-    assert instance.search_assets.call_args.kwargs["city"] == "Los Angeles"
-    assert instance.search_assets.call_args.kwargs["state"] == "California"
-    assert instance.search_assets.call_args.kwargs["country"] == "USA"
+    instance.count_assets.assert_called_once()
+    assert instance.count_assets.call_args.kwargs["query"] == "beach"
+    assert instance.count_assets.call_args.kwargs["city"] == "Los Angeles"
+    assert instance.count_assets.call_args.kwargs["state"] == "California"
+    assert instance.count_assets.call_args.kwargs["country"] == "USA"
+    instance.search_assets.assert_not_called()
+
+
+def test_admin_match_count_fallback_ignores_deprecated_metadata_total(tmp_path: Path) -> None:
+    """Metadata-search total should not cap counts at the page size."""
+    client = make_client(tmp_path)
+    login(client)
+
+    with patch("immich_bridge.api.admin.ImmichClient") as fake_client:
+        instance = fake_client.return_value
+        instance.count_assets.side_effect = ImmichApiError("not found", status_code=404)
+        instance.search_assets.side_effect = [
+            SearchPage(
+                items=[{"id": f"asset-{index}"} for index in range(500)],
+                next_page="2",
+                total=500,
+            ),
+            SearchPage(items=[{"id": "asset-500"}], next_page=None, total=500),
+        ]
+
+        count = client.post(
+            "/api/admin/views/match-count",
+            json={
+                "filters": {
+                    "album_ids": [],
+                    "person_ids": [],
+                    "tag_ids": [],
+                    "is_favorite": None,
+                    "media_type": None,
+                    "taken_after": None,
+                    "taken_before": None,
+                    "rating": None,
+                    "query": "beach",
+                    "original_file_name": None,
+                    "ocr": None,
+                    "city": None,
+                    "state": None,
+                    "country": None,
+                }
+            },
+        )
+
+    assert count.status_code == 200
+    assert count.json()["count"] == 501
+    instance.count_assets.assert_called_once()
+    assert instance.search_assets.call_count == 2
+    assert instance.search_assets.call_args_list[0].kwargs["size"] == 500
+    assert instance.search_assets.call_args_list[0].kwargs["with_exif"] is False

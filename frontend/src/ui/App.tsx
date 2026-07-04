@@ -259,7 +259,7 @@ function Overview({ diagnostics }: { diagnostics?: Diagnostics }) {
 function ViewsPanel() {
   const queryClient = useQueryClient();
   const [editor, setEditor] = useState<EditorState>(null);
-  const views = useQuery({ queryKey: ["views"], queryFn: api.views });
+  const views = useQuery({ queryKey: ["views"], queryFn: () => api.views() });
   const tags = useQuery({ queryKey: ["view-options", "tags"], queryFn: api.tagOptions });
   const people = useQuery({ queryKey: ["view-options", "people"], queryFn: api.peopleOptions });
   const optionLookup = useMemo(
@@ -268,6 +268,7 @@ function ViewsPanel() {
   );
   const invalidateAdminData = () => {
     queryClient.invalidateQueries({ queryKey: ["views"] });
+    queryClient.invalidateQueries({ queryKey: ["view-match-count"] });
     queryClient.invalidateQueries({ queryKey: ["diagnostics"] });
   };
   const createView = useMutation({
@@ -310,6 +311,7 @@ function ViewsPanel() {
               tags.refetch();
               people.refetch();
               views.refetch();
+              queryClient.invalidateQueries({ queryKey: ["view-match-count"] });
             }}
             type="button"
             title="Refresh views"
@@ -408,6 +410,14 @@ function ViewRow({
   pending: boolean;
 }) {
   const chips = filterChips(view.filters, optionLookup);
+  const count = useQuery({
+    queryKey: ["view-match-count", view.id, view.updated_at, view.filters],
+    queryFn: () => api.matchCount(view.filters),
+    retry: false,
+    staleTime: 30_000
+  });
+  const countValue = count.data?.count ?? (!count.isError ? view.match_count : null);
+  const loadingCount = count.isLoading || (count.isFetching && count.data == null && view.match_count == null);
 
   return (
     <article className={active ? "view-row active" : "view-row"}>
@@ -426,7 +436,12 @@ function ViewRow({
           ))}
         </div>
       </button>
-      <CountPill count={view.match_count} />
+      <CountPill
+        count={countValue}
+        loading={loadingCount}
+        errorMessage={count.isError ? messageFromError(count.error) : null}
+        onRefresh={() => count.refetch()}
+      />
       <div className="row-actions">
         <button className="icon-button" onClick={onEdit} type="button" title="Edit view">
           <Pencil size={16} />
@@ -445,7 +460,40 @@ function ViewRow({
   );
 }
 
-function CountPill({ count }: { count?: number | null }) {
+function CountPill({
+  count,
+  loading,
+  errorMessage,
+  onRefresh
+}: {
+  count?: number | null;
+  loading: boolean;
+  errorMessage: string | null;
+  onRefresh: () => void;
+}) {
+  if (loading) {
+    return (
+      <div className="count-pill loading" title="Counting matching assets">
+        <RefreshCw className="count-spinner" size={18} />
+        <span>counting</span>
+      </div>
+    );
+  }
+
+  if (errorMessage) {
+    return (
+      <button
+        className="count-pill count-button muted"
+        onClick={onRefresh}
+        type="button"
+        title={errorMessage}
+      >
+        <RefreshCw size={16} />
+        <span>retry count</span>
+      </button>
+    );
+  }
+
   return (
     <div className={count == null ? "count-pill muted" : "count-pill"}>
       <strong>{count == null ? "--" : formatCount(count)}</strong>
@@ -492,6 +540,7 @@ function ViewComposer({
     retry: false,
     staleTime: 5000
   });
+  const previewCountLabel = countPreviewLabel(draft.name, countPreview);
   const updateFilter = <K extends keyof ViewFilters>(key: K, value: ViewFilters[K]) => {
     setDraft((current) => ({ ...current, filters: { ...current.filters, [key]: value } }));
   };
@@ -726,15 +775,13 @@ function ViewComposer({
       </details>
 
       <div className="preview-panel">
-        <ListFilter size={18} />
+        {countPreview.isFetching ? (
+          <RefreshCw className="count-spinner" size={18} />
+        ) : (
+          <ListFilter size={18} />
+        )}
         <div>
-          <strong>
-            {countPreview.isError
-              ? "count unavailable"
-              : countPreview.isFetching
-                ? "counting"
-                : `${formatCount(countPreview.data?.count ?? null)} matching assets`}
-          </strong>
+          <strong>{previewCountLabel}</strong>
           <span>{draft.name.trim() ? `/Views/${draft.name.trim()}` : "Name the view to preview it"}</span>
         </div>
         <button
@@ -1236,6 +1283,17 @@ function labelsForIds(ids: string[], options: Map<string, OptionItem>) {
 
 function shortId(id: string) {
   return id.length > 10 ? `${id.slice(0, 8)}...` : id;
+}
+
+function countPreviewLabel(
+  name: string,
+  preview: { data?: { count: number | null }; isError: boolean; isFetching: boolean }
+) {
+  if (!name.trim()) return "Preview count";
+  if (preview.isError) return "count unavailable";
+  if (preview.isFetching) return "counting matching assets";
+  if (preview.data?.count == null) return "count unavailable";
+  return `${formatCount(preview.data.count)} matching assets`;
 }
 
 function formatCount(count?: number | null) {

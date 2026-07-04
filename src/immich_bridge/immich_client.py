@@ -631,13 +631,112 @@ class ImmichClient:
         with_exif: bool = True,
     ) -> SearchPage:
         """Search assets by Immich metadata filters."""
-        body: dict[str, Any] = {
-            "page": page,
-            "size": size,
-            "withExif": with_exif,
-        }
+        body = self._asset_search_filter_body(
+            album_ids=album_ids,
+            person_ids=person_ids,
+            tag_ids=tag_ids,
+            is_favorite=is_favorite,
+            media_type=media_type,
+            taken_after=taken_after,
+            taken_before=taken_before,
+            rating=rating,
+            query=query,
+            original_file_name=original_file_name,
+            ocr=ocr,
+            city=city,
+            state=state,
+            country=country,
+        )
+        body.update({"page": page, "size": size, "withExif": with_exif})
         if order:
             body["order"] = order
+
+        key = self._cache_key("search", body)
+
+        def loader() -> dict[str, Any]:
+            payload = self._request_json("POST", "search/metadata", json_body=body)
+            assets = payload.get("assets", {}) if isinstance(payload, dict) else {}
+            return {
+                "items": assets.get("items", []),
+                "nextPage": assets.get("nextPage"),
+                "total": assets.get("total"),
+            }
+
+        cached = self._cached(key, self._search_cache_ttl_seconds, loader)
+        return SearchPage(
+            items=list(cached.get("items", [])),
+            next_page=cached.get("nextPage"),
+            total=cached.get("total"),
+        )
+
+    def count_assets(
+        self,
+        *,
+        album_ids: list[str] | None = None,
+        person_ids: list[str] | None = None,
+        tag_ids: list[str] | None = None,
+        is_favorite: bool | None = None,
+        media_type: str | None = None,
+        taken_after: str | None = None,
+        taken_before: str | None = None,
+        rating: int | None = None,
+        query: str | None = None,
+        original_file_name: str | None = None,
+        ocr: str | None = None,
+        city: str | None = None,
+        state: str | None = None,
+        country: str | None = None,
+    ) -> int:
+        """Return the total number of assets matching metadata filters."""
+        body = self._asset_search_filter_body(
+            album_ids=album_ids,
+            person_ids=person_ids,
+            tag_ids=tag_ids,
+            is_favorite=is_favorite,
+            media_type=media_type,
+            taken_after=taken_after,
+            taken_before=taken_before,
+            rating=rating,
+            query=query,
+            original_file_name=original_file_name,
+            ocr=ocr,
+            city=city,
+            state=state,
+            country=country,
+        )
+        key = self._cache_key("search-statistics", body)
+
+        def loader() -> dict[str, Any]:
+            payload = self._request_json("POST", "search/statistics", json_body=body)
+            return {"total": payload.get("total")} if isinstance(payload, dict) else {"total": None}
+
+        cached = self._cached(key, self._search_cache_ttl_seconds, loader)
+        total = cached.get("total")
+        try:
+            return int(total)
+        except (TypeError, ValueError) as e:
+            raise ImmichApiError("Immich search statistics response did not include total") from e
+
+    def _asset_search_filter_body(
+        self,
+        *,
+        album_ids: list[str] | None = None,
+        person_ids: list[str] | None = None,
+        tag_ids: list[str] | None = None,
+        is_favorite: bool | None = None,
+        media_type: str | None = None,
+        taken_after: str | None = None,
+        taken_before: str | None = None,
+        rating: int | None = None,
+        query: str | None = None,
+        original_file_name: str | None = None,
+        ocr: str | None = None,
+        city: str | None = None,
+        state: str | None = None,
+        country: str | None = None,
+    ) -> dict[str, Any]:
+        """Return an Immich metadata-search/statistics filter payload."""
+        body: dict[str, Any] = {}
         if album_ids:
             body["albumIds"] = album_ids
         if person_ids:
@@ -666,24 +765,7 @@ class ImmichClient:
             body["state"] = state
         if country:
             body["country"] = country
-
-        key = self._cache_key("search", body)
-
-        def loader() -> dict[str, Any]:
-            payload = self._request_json("POST", "search/metadata", json_body=body)
-            assets = payload.get("assets", {}) if isinstance(payload, dict) else {}
-            return {
-                "items": assets.get("items", []),
-                "nextPage": assets.get("nextPage"),
-                "total": assets.get("total"),
-            }
-
-        cached = self._cached(key, self._search_cache_ttl_seconds, loader)
-        return SearchPage(
-            items=list(cached.get("items", [])),
-            next_page=cached.get("nextPage"),
-            total=cached.get("total"),
-        )
+        return body
 
     def _open_original_response(
         self,
