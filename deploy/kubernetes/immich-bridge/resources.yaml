@@ -1,0 +1,231 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: immich-bridge
+  name: immich-bridge
+  namespace: default
+  annotations:
+    secret.reloader.stakater.com/reload: immich-bridge-secrets
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: immich-bridge
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: immich-bridge
+    spec:
+      securityContext:
+        fsGroup: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+      - name: immich-bridge
+        image: ghcr.io/barryw/immich-bridge:latest
+        imagePullPolicy: Always
+        env:
+        - name: IMMICH_URL
+          value: http://immich-server.default.svc.cluster.local:2283/api
+        - name: ADMIN_PORT
+          value: "8080"
+        - name: WEBDAV_PORT
+          value: "8081"
+        - name: DATABASE_URL
+          value: sqlite:////var/lib/immich-bridge/immich-bridge.db
+        - name: PUBLIC_BASE_URL
+          value: https://immich-bridge.barrywalker.io
+        - name: HSTS_MAX_AGE_SECONDS
+          value: "31536000"
+        - name: SUPERADMIN_USERNAME
+          value: barry
+        - name: SUPERADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: SUPERADMIN_PASSWORD
+              name: immich-bridge-secrets
+        - name: REDIS_HOST
+          value: redis.default.svc.cluster.local
+        - name: REDIS_PORT
+          value: "6379"
+        - name: REDIS_DB
+          value: "4"
+        - name: BLOB_CACHE_ENABLED
+          value: "true"
+        - name: BLOB_CACHE_DIR
+          value: /var/cache/immich-bridge/blob-cache
+        - name: BLOB_CACHE_MAX_BYTES
+          value: "1073741824"
+        - name: LOG_LEVEL
+          value: INFO
+        - name: LOG_FORMAT
+          value: json
+        - name: IMMICH_BRIDGE_METRICS
+          value: "false"
+        - name: GRANT_SIGNING_SECRET
+          valueFrom:
+            secretKeyRef:
+              key: GRANT_SIGNING_SECRET
+              name: immich-bridge-secrets
+        ports:
+        - containerPort: 8080
+          name: admin
+          protocol: TCP
+        - containerPort: 8081
+          name: webdav
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: admin
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: admin
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: "1"
+            memory: 1Gi
+        volumeMounts:
+        - mountPath: /var/lib/immich-bridge
+          name: config
+        - mountPath: /var/cache/immich-bridge
+          name: cache
+        - mountPath: /tmp
+          name: tmp
+      imagePullSecrets:
+      - name: ghcr-secret
+      restartPolicy: Always
+      volumes:
+      - name: config
+        persistentVolumeClaim:
+          claimName: immich-bridge-data
+      - emptyDir:
+          sizeLimit: 2Gi
+        name: cache
+      - emptyDir: {}
+        name: tmp
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: immich-bridge
+  name: immich-bridge
+  namespace: default
+spec:
+  ports:
+  - name: admin
+    port: 8080
+    protocol: TCP
+    targetPort: admin
+  - name: webdav
+    port: 8081
+    protocol: TCP
+    targetPort: webdav
+  selector:
+    app: immich-bridge
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    traefik.ingress.kubernetes.io/proxy-body-size: "0"
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    traefik.ingress.kubernetes.io/router.middlewares: default-secure-headers@kubernetescrd,default-large-upload@kubernetescrd
+  labels:
+    app: immich-bridge
+  name: immich-bridge
+  namespace: default
+spec:
+  ingressClassName: traefik
+  rules:
+  - host: immich-bridge.barrywalker.io
+    http:
+      paths:
+      - backend:
+          service:
+            name: immich-bridge
+            port:
+              name: admin
+        path: /admin
+        pathType: Prefix
+      - backend:
+          service:
+            name: immich-bridge
+            port:
+              name: admin
+        path: /api
+        pathType: Prefix
+      - backend:
+          service:
+            name: immich-bridge
+            port:
+              name: admin
+        path: /docs
+        pathType: Prefix
+      - backend:
+          service:
+            name: immich-bridge
+            port:
+              name: admin
+        path: /redoc
+        pathType: Prefix
+      - backend:
+          service:
+            name: immich-bridge
+            port:
+              name: admin
+        path: /openapi.json
+        pathType: Exact
+      - backend:
+          service:
+            name: immich-bridge
+            port:
+              name: admin
+        path: /health
+        pathType: Exact
+      - backend:
+          service:
+            name: immich-bridge
+            port:
+              name: admin
+        path: /ready
+        pathType: Exact
+      - backend:
+          service:
+            name: immich-bridge
+            port:
+              name: webdav
+        path: /
+        pathType: Prefix
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  labels:
+    app: immich-bridge
+  name: immich-bridge-data
+  namespace: default
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+  storageClassName: longhorn

@@ -147,6 +147,10 @@ Admin APIs live under `/api/admin/*`; the UI calls only those APIs. Saved views 
 stored in SQLite on the long-lived `configdata` Compose volume and rendered into DAV
 as `/Views/<name>/`.
 
+Native filesystem client planning lives in `macos/` and `windows/`. Both clients
+target the shared backend contract in `docs/native-fs-api.md` so FSKit, Cloud Files,
+and any future mounted-drive client reuse the same server-side layout and policy.
+
 ## Write Semantics
 
 Write behavior is intentionally narrow:
@@ -164,7 +168,8 @@ disabled until explicit safety controls exist.
 
 Next work includes duplicate handling, richer client compatibility testing, sidecar
 files, edit-session workflows, optional thumbnails, tags, people, places, shares,
-and native filesystem clients.
+the shared native filesystem API, the macOS FSKit menu bar app, and later Windows
+Cloud Files integration.
 
 ## Safety Model
 

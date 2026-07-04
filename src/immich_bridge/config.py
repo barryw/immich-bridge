@@ -21,6 +21,26 @@ class Settings(BaseSettings):
         default=43_200,
         description="Admin UI/API session TTL",
     )
+    grant_signing_secret: SecretStr = Field(
+        default=SecretStr("immich-bridge-dev-grant-secret-change-me"),
+        description="HMAC secret used to sign UI grant hints",
+    )
+    public_base_url: str | None = Field(
+        default=None,
+        description="Public HTTPS base URL for cookies, redirects, and clients",
+    )
+    hsts_max_age_seconds: int = Field(
+        default=0,
+        description="Emit Strict-Transport-Security when greater than zero",
+    )
+    superadmin_username: str | None = Field(
+        default=None,
+        description="Optional local bridge superadmin username",
+    )
+    superadmin_password: SecretStr | None = Field(
+        default=None,
+        description="Optional local bridge superadmin password, usually from a secret",
+    )
 
     redis_host: str | None = Field(default=None, description="Redis host for cache and locks")
     redis_port: int = Field(default=6379, description="Redis port")

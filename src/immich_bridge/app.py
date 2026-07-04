@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,6 +13,7 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from immich_bridge.admin_store import get_admin_store
 from immich_bridge.api.admin import router as admin_router
+from immich_bridge.api.auth import router as auth_router
 from immich_bridge.api.health import router as health_router
 from immich_bridge.cache import init_cache
 from immich_bridge.config import get_settings
@@ -33,7 +35,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         redis_db=settings.redis_db,
         redis_password=redis_password,
     )
-    get_admin_store(settings.database_url)
+    get_admin_store(settings.database_url).ensure_default_library(settings.immich_url)
 
     logger.info("application_starting", admin_port=settings.admin_port)
     yield
@@ -57,11 +59,32 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    app.include_router(auth_router)
     app.include_router(admin_router)
     app.include_router(health_router)
+    _install_security_headers(app)
     _mount_admin_ui(app)
 
     return app
+
+
+def _install_security_headers(app: FastAPI) -> None:
+    """Install public-service security headers."""
+
+    class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):  # type: ignore[no-untyped-def]
+            response = await call_next(request)
+            settings_provider = request.app.dependency_overrides.get(get_settings, get_settings)
+            settings = settings_provider()
+            if settings.hsts_max_age_seconds <= 0:
+                return response
+            response.headers.setdefault(
+                "Strict-Transport-Security",
+                f"max-age={settings.hsts_max_age_seconds}; includeSubDomains",
+            )
+            return response
+
+    app.add_middleware(SecurityHeadersMiddleware)
 
 
 def _mount_admin_ui(app: FastAPI) -> None:

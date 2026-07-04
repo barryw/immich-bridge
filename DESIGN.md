@@ -95,6 +95,12 @@ Open API questions to verify in implementation:
 - Admin/API service: configure shares, safety settings, cache, auth diagnostics, and DAV activity.
 - WebDAV service: mountable virtual filesystem backed by Immich APIs.
 
+Native filesystem clients are separate platform packages that consume a shared bridge API:
+
+- macOS: a Swift menu bar app plus an FSKit extension, with one mounted volume per library profile.
+- Windows: a future tray app using the Cloud Files API for Explorer-native sync roots, with WinFsp as a possible mounted-drive option.
+- Shared backend: `/api/fs/v1`, documented in `docs/native-fs-api.md`, exposes opaque nodes, children, content streams, and capability flags so clients do not reimplement Immich layout or write policy.
+
 Default mount experience:
 
 ```text

@@ -4,16 +4,19 @@ from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from immich_bridge.admin_store import get_admin_store
 from immich_bridge.api.admin import SESSION_COOKIE
 from immich_bridge.app import create_app
+from immich_bridge.authz import verify_grants_token
 from immich_bridge.config import Settings, get_settings
 from immich_bridge.immich_auth import ImmichIdentity
 from immich_bridge.immich_client import ImmichApiError, SearchPage
+from immich_bridge.share_auth import ShareIdentity
 
 
-def make_client(tmp_path: Path) -> TestClient:
+def make_client(tmp_path: Path, *, superadmin_password: str | None = None) -> TestClient:
     """Create an admin API client backed by a temporary database."""
     get_admin_store.cache_clear()
     settings = Settings(
@@ -21,6 +24,8 @@ def make_client(tmp_path: Path) -> TestClient:
         database_url=f"sqlite:///{tmp_path / 'bridge.db'}",
         redis_host=None,
         log_format="console",
+        superadmin_username="root" if superadmin_password else None,
+        superadmin_password=SecretStr(superadmin_password) if superadmin_password else None,
     )
     app = create_app()
     app.dependency_overrides[get_settings] = lambda: settings
@@ -53,6 +58,18 @@ def login(client: TestClient) -> str:
     return str(response.json()["session_token"])
 
 
+def superadmin_login(client: TestClient) -> str:
+    """Login as local bridge superadmin and return bearer token."""
+    response = client.post(
+        "/api/admin/session",
+        json={"username": "root", "api_key": "secret"},
+    )
+    assert response.status_code == 200
+    assert response.json()["principal"]["kind"] == "superadmin"
+    assert response.json()["grants"][0]["scope"] == "instance"
+    return str(response.json()["session_token"])
+
+
 def test_admin_session_requires_immich_admin(tmp_path: Path) -> None:
     """Only Immich admin users should receive admin sessions."""
     client = make_client(tmp_path)
@@ -82,8 +99,353 @@ def test_admin_session_cookie_and_bearer_auth(tmp_path: Path) -> None:
 
     assert cookie_response.status_code == 200
     assert cookie_response.json()["user"]["id"] == "user-1"
+    assert cookie_response.json()["principal"]["kind"] == "immich_admin"
+    assert cookie_response.json()["grants"][0]["library_id"] == "default"
+    assert "manage_views" in cookie_response.json()["grants"][0]["capabilities"]
     assert bearer_response.status_code == 200
     assert bearer_response.json()["user"]["email"] == "barry@example.com"
+    grant_payload = verify_grants_token(
+        "immich-bridge-dev-grant-secret-change-me",
+        cookie_response.json()["grant_token"],
+    )
+    assert grant_payload is not None
+    assert grant_payload["sub"] == "user-1"
+    assert (
+        verify_grants_token(
+            "immich-bridge-dev-grant-secret-change-me",
+            f"{cookie_response.json()['grant_token']}tampered",
+        )
+        is None
+    )
+
+
+def test_admin_libraries_are_discovered_from_session_grants(tmp_path: Path) -> None:
+    """Admin login should grant access to configured libraries where the key is admin."""
+    client = make_client(tmp_path)
+    store = get_admin_store(f"sqlite:///{tmp_path / 'bridge.db'}")
+    store.ensure_default_library("http://immich.test/api")
+    store.upsert_library(
+        {
+            "id": "work",
+            "name": "Work Photos",
+            "immich_url": "http://work-immich.test/api",
+            "is_default": False,
+        }
+    )
+    token = login(client)
+
+    response = client.get("/api/admin/libraries", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 200
+    assert [library["id"] for library in response.json()["libraries"]] == ["default", "work"]
+
+
+def test_superadmin_can_create_and_update_libraries(tmp_path: Path) -> None:
+    """Local bridge superadmins should manage configured libraries."""
+    client = make_client(tmp_path, superadmin_password="secret")
+    token = superadmin_login(client)
+
+    create_response = client.post(
+        "/api/admin/libraries",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "id": "family",
+            "name": "Family Photos",
+            "immich_url": "https://pics.example.test/api/",
+            "public_url": "https://pics.example.test/",
+            "share_hosts": ["share.example.test", "share.example.test", "HTTPS://OLD.EXAMPLE.TEST"],
+            "is_default": False,
+        },
+    )
+    assert create_response.status_code == 201
+    assert create_response.json()["id"] == "family"
+    assert create_response.json()["immich_url"] == "https://pics.example.test/api"
+    assert create_response.json()["public_url"] == "https://pics.example.test"
+    assert create_response.json()["share_hosts"] == [
+        "share.example.test",
+        "https://old.example.test",
+    ]
+
+    update_response = client.put(
+        "/api/admin/libraries/family",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "name": "Family Archive",
+            "immich_url": "https://archive.example.test/api",
+            "public_url": "https://archive-public.example.test",
+            "share_hosts": ["archive-share.example.test:8443"],
+            "is_default": False,
+        },
+    )
+    assert update_response.status_code == 200
+    assert update_response.json()["name"] == "Family Archive"
+    assert update_response.json()["public_url"] == "https://archive-public.example.test"
+    assert update_response.json()["share_hosts"] == ["archive-share.example.test:8443"]
+    libraries = client.get(
+        "/api/admin/libraries",
+        headers={"Authorization": f"Bearer {token}"},
+    ).json()["libraries"]
+    assert {library["id"] for library in libraries} == {"default", "family"}
+
+
+def test_library_admin_cannot_create_libraries(tmp_path: Path) -> None:
+    """Immich library admins should not configure arbitrary upstream libraries."""
+    client = make_client(tmp_path)
+    token = login(client)
+
+    response = client.post(
+        "/api/admin/libraries",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "id": "blocked",
+            "name": "Blocked",
+            "immich_url": "https://blocked.example.test/api",
+        },
+    )
+
+    assert response.status_code == 403
+
+
+def test_share_link_login_creates_share_guest_mount(tmp_path: Path) -> None:
+    """Shared links should create share-scoped, non-admin sessions."""
+    client = make_client(tmp_path)
+    with patch(
+        "immich_bridge.api.auth.validate_immich_share_link",
+        return_value=ShareIdentity(
+            share_id="share-1",
+            name="Summer Trip",
+            description="Summer Trip",
+            allow_download=True,
+            allow_upload=False,
+            expires_at=None,
+            asset_count=23,
+            album_id="album-1",
+        ),
+    ) as validate_share:
+        response = client.post(
+            "/api/auth/share-link",
+            json={"share_url": "http://immich.test/share/share-secret"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    token = payload["session_token"]
+    assert payload["principal"]["kind"] == "share_guest"
+    assert payload["grants"][0]["scope"] == "share"
+    assert payload["grants"][0]["library_id"] == "default"
+    assert payload["grants"][0]["share_name"] == "Summer Trip"
+    assert "browse" in payload["grants"][0]["capabilities"]
+    assert "download" in payload["grants"][0]["capabilities"]
+    assert "manage_views" not in payload["grants"][0]["capabilities"]
+    assert "share-secret" not in str(payload["grants"])
+    assert (
+        verify_grants_token(
+            "immich-bridge-dev-grant-secret-change-me",
+            payload["grant_token"],
+        )
+        is not None
+    )
+    validate_share.assert_called_once_with(
+        "http://immich.test/api",
+        "share-secret",
+        timeout_seconds=10.0,
+    )
+
+    mounts = client.get("/api/me/mounts", headers={"Authorization": f"Bearer {token}"})
+    assert mounts.status_code == 200
+    assert mounts.json()["mounts"] == [
+        {
+            "id": "share:default:share-1",
+            "kind": "share",
+            "library_id": "default",
+            "library_name": "Default Library",
+            "display_name": "Summer Trip",
+            "scope": "share",
+            "capabilities": ["browse", "thumbnail", "download"],
+            "share_id": "share-1",
+            "asset_count": 23,
+            "expires_at": None,
+        }
+    ]
+
+    assert (
+        client.get("/api/admin/views", headers={"Authorization": f"Bearer {token}"}).status_code
+        == 403
+    )
+    assert client.get(
+        "/api/admin/libraries", headers={"Authorization": f"Bearer {token}"}
+    ).json() == {"libraries": []}
+
+
+def test_share_link_login_accepts_public_url_for_internal_library_url(tmp_path: Path) -> None:
+    """Public share-link URLs should map to the library's internal API URL."""
+    client = make_client(tmp_path)
+    store = get_admin_store(f"sqlite:///{tmp_path / 'bridge.db'}")
+    store.upsert_library(
+        {
+            "id": "default",
+            "name": "Default Library",
+            "immich_url": "http://immich.svc.cluster.local/api",
+            "public_url": "https://pics.example.test",
+            "is_default": True,
+        }
+    )
+
+    with patch(
+        "immich_bridge.api.auth.validate_immich_share_link",
+        return_value=ShareIdentity(
+            share_id="share-1",
+            name="Shared Album",
+            description=None,
+            allow_download=True,
+            allow_upload=False,
+            expires_at=None,
+            asset_count=2,
+            album_id="album-1",
+        ),
+    ) as validate_share:
+        response = client.post(
+            "/api/auth/share-link",
+            json={"share_url": "https://pics.example.test/share/share-secret"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["grants"][0]["library_id"] == "default"
+    validate_share.assert_called_once_with(
+        "http://immich.svc.cluster.local/api",
+        "share-secret",
+        timeout_seconds=10.0,
+    )
+
+
+def test_share_link_login_accepts_allowed_share_host(tmp_path: Path) -> None:
+    """Allowed share hosts should support public aliases without changing the API URL."""
+    client = make_client(tmp_path)
+    store = get_admin_store(f"sqlite:///{tmp_path / 'bridge.db'}")
+    store.upsert_library(
+        {
+            "id": "default",
+            "name": "Default Library",
+            "immich_url": "http://immich.svc.cluster.local/api",
+            "share_hosts": ["pics.example.test"],
+            "is_default": True,
+        }
+    )
+
+    with patch(
+        "immich_bridge.api.auth.validate_immich_share_link",
+        return_value=ShareIdentity(
+            share_id="share-1",
+            name="Shared Album",
+            description=None,
+            allow_download=True,
+            allow_upload=False,
+            expires_at=None,
+            asset_count=2,
+            album_id="album-1",
+        ),
+    ) as validate_share:
+        response = client.post(
+            "/api/auth/share-link",
+            json={"share_url": "https://pics.example.test/share/share-secret"},
+        )
+
+    assert response.status_code == 200
+    validate_share.assert_called_once_with(
+        "http://immich.svc.cluster.local/api",
+        "share-secret",
+        timeout_seconds=10.0,
+    )
+
+
+def test_share_link_login_rejects_unconfigured_hosts(tmp_path: Path) -> None:
+    """The bridge must not proxy shared links from arbitrary Immich hosts."""
+    client = make_client(tmp_path)
+
+    with patch("immich_bridge.api.auth.validate_immich_share_link") as validate_share:
+        response = client.post(
+            "/api/auth/share-link",
+            json={"share_url": "https://other.example.test/share/share-secret"},
+        )
+
+    assert response.status_code == 400
+    assert "not configured" in response.json()["detail"]
+    validate_share.assert_not_called()
+
+
+def test_library_scoped_views_do_not_bleed_between_libraries(tmp_path: Path) -> None:
+    """Saved views should be scoped by library id."""
+    client = make_client(tmp_path)
+    store = get_admin_store(f"sqlite:///{tmp_path / 'bridge.db'}")
+    store.ensure_default_library("http://immich.test/api")
+    store.upsert_library(
+        {
+            "id": "work",
+            "name": "Work Photos",
+            "immich_url": "http://work-immich.test/api",
+            "is_default": False,
+        }
+    )
+    login(client)
+
+    payload = {
+        "name": "Favorites",
+        "description": "",
+        "enabled": True,
+        "layout": "flat",
+        "filters": {
+            "album_ids": [],
+            "person_ids": [],
+            "tag_ids": [],
+            "is_favorite": True,
+            "media_type": None,
+            "taken_after": None,
+            "taken_before": None,
+            "rating": None,
+            "query": None,
+            "original_file_name": None,
+            "ocr": None,
+            "city": None,
+            "state": None,
+            "country": None,
+        },
+    }
+
+    default_response = client.post("/api/admin/views", json=payload)
+    work_response = client.post("/api/admin/libraries/work/views", json=payload)
+
+    assert default_response.status_code == 201
+    assert work_response.status_code == 201
+    assert default_response.json()["id"] != work_response.json()["id"]
+    assert [view["id"] for view in client.get("/api/admin/views").json()["views"]] == [
+        default_response.json()["id"]
+    ]
+    assert [
+        view["id"] for view in client.get("/api/admin/libraries/work/views").json()["views"]
+    ] == [work_response.json()["id"]]
+
+
+def test_library_scoped_policy_does_not_change_default_library(tmp_path: Path) -> None:
+    """Mount/write policy updates should be library-scoped."""
+    client = make_client(tmp_path)
+    store = get_admin_store(f"sqlite:///{tmp_path / 'bridge.db'}")
+    store.ensure_default_library("http://immich.test/api")
+    store.upsert_library(
+        {
+            "id": "work",
+            "name": "Work Photos",
+            "immich_url": "http://work-immich.test/api",
+            "is_default": False,
+        }
+    )
+    login(client)
+
+    work_mount = client.get("/api/admin/libraries/work/mount").json()
+    work_mount["people_enabled"] = True
+    assert client.put("/api/admin/libraries/work/mount", json=work_mount).status_code == 200
+
+    assert client.get("/api/admin/libraries/work/mount").json()["people_enabled"] is True
+    assert client.get("/api/admin/mount").json()["people_enabled"] is False
 
 
 def test_admin_views_crud_and_diagnostics(tmp_path: Path) -> None:
@@ -263,6 +625,27 @@ def test_admin_options_and_match_count_use_immich_api(tmp_path: Path) -> None:
                 }
             },
         )
+        scoped_count = client.post(
+            "/api/admin/libraries/default/views/match-count",
+            json={
+                "filters": {
+                    "album_ids": [],
+                    "person_ids": [],
+                    "tag_ids": [],
+                    "is_favorite": None,
+                    "media_type": None,
+                    "taken_after": None,
+                    "taken_before": None,
+                    "rating": None,
+                    "query": "beach",
+                    "original_file_name": None,
+                    "ocr": None,
+                    "city": "Los Angeles",
+                    "state": "California",
+                    "country": "USA",
+                }
+            },
+        )
 
     assert tags.status_code == 200
     assert tags.json()["items"][0]["name"] == "Family"
@@ -270,7 +653,9 @@ def test_admin_options_and_match_count_use_immich_api(tmp_path: Path) -> None:
     assert people.json()["items"][0]["name"] == "Alice"
     assert count.status_code == 200
     assert count.json()["count"] == 11
-    instance.count_assets.assert_called_once()
+    assert scoped_count.status_code == 200
+    assert scoped_count.json()["count"] == 11
+    assert instance.count_assets.call_count == 2
     assert instance.count_assets.call_args.kwargs["query"] == "beach"
     assert instance.count_assets.call_args.kwargs["city"] == "Los Angeles"
     assert instance.count_assets.call_args.kwargs["state"] == "California"

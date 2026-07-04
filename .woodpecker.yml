@@ -1,0 +1,97 @@
+# Woodpecker CI/CD for immich-bridge.
+#
+# PR/manual: backend checks, frontend build, image build dry run.
+# main push: backend checks, frontend build, GHCR publish, GitOps image bump.
+#
+# Required Woodpecker secrets:
+#   ghcr_token   - token with package write access for ghcr.io/barryw/immich-bridge
+#   github_token - token with contents write access to barryw/infrastructure
+
+labels:
+  platform: linux/amd64
+
+when:
+  - event: [push, pull_request, manual]
+
+steps:
+  lint:
+    image: python:3.12-slim
+    commands:
+      - pip install uv
+      - uv sync --frozen --all-extras
+      - uv run ruff check src tests
+      - uv run ruff format --check src tests
+
+  typecheck:
+    image: python:3.12-slim
+    commands:
+      - pip install uv
+      - uv sync --frozen --all-extras
+      - uv run mypy src
+    depends_on: [lint]
+
+  test:
+    image: python:3.12-slim
+    environment:
+      IMMICH_URL: http://immich.test/api
+    commands:
+      - pip install uv
+      - uv sync --frozen --all-extras
+      - uv run pytest --tb=short -q
+    depends_on: [typecheck]
+
+  frontend-build:
+    image: node:26-alpine
+    commands:
+      - cd frontend
+      - npm ci
+      - npm run build
+
+  image-dry-run:
+    image: gcr.io/kaniko-project/executor:debug
+    when:
+      - event: [pull_request, manual]
+    commands:
+      - /kaniko/executor --dockerfile=Dockerfile --context=. --no-push
+    depends_on: [test, frontend-build]
+
+  image-publish:
+    image: gcr.io/kaniko-project/executor:debug
+    when:
+      - event: push
+        branch: main
+    environment:
+      GHCR_TOKEN:
+        from_secret: ghcr_token
+    commands:
+      - SHORT_SHA=$(printf "%.12s" "$CI_COMMIT_SHA")
+      - IMAGE_TAG="sha-$SHORT_SHA"
+      - mkdir -p /kaniko/.docker
+      - printf '{"auths":{"ghcr.io":{"username":"barryw","password":"%s"}}}\n' "$GHCR_TOKEN" > /kaniko/.docker/config.json
+      - BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+      - echo "Publishing ghcr.io/barryw/immich-bridge:$IMAGE_TAG"
+      - /kaniko/executor --dockerfile=Dockerfile --context=. --destination=ghcr.io/barryw/immich-bridge:$IMAGE_TAG --destination=ghcr.io/barryw/immich-bridge:latest --label "org.opencontainers.image.created=$BUILD_DATE" --label "org.opencontainers.image.revision=$CI_COMMIT_SHA" --label "org.opencontainers.image.source=https://github.com/barryw/immich-bridge"
+    depends_on: [test, frontend-build]
+
+  gitops-image-bump:
+    image: alpine/git:2.47.2
+    when:
+      - event: push
+        branch: main
+    environment:
+      GITHUB_TOKEN:
+        from_secret: github_token
+    commands:
+      - SHORT_SHA=$(printf "%.12s" "$CI_COMMIT_SHA")
+      - IMAGE_TAG="sha-$SHORT_SHA"
+      - git clone "https://x-access-token:$GITHUB_TOKEN@github.com/barryw/infrastructure.git" /tmp/infrastructure
+      - cd /tmp/infrastructure
+      - git config user.email "ci@woodpecker.local"
+      - git config user.name "Woodpecker CI"
+      - test -f kubernetes-default/immich-bridge/resources.yaml
+      - sed -i "s#ghcr.io/barryw/immich-bridge:[^[:space:]]*#ghcr.io/barryw/immich-bridge:$IMAGE_TAG#g" kubernetes-default/immich-bridge/resources.yaml
+      - git diff --quiet && { echo "GitOps manifest already references $IMAGE_TAG"; exit 0; }
+      - git add kubernetes-default/immich-bridge/resources.yaml
+      - 'git commit -m "deploy: immich-bridge $IMAGE_TAG"'
+      - git push origin main
+    depends_on: [image-publish]

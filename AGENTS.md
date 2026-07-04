@@ -9,7 +9,8 @@ startup lives in `app.py`, `main.py`, and `api/`.
 
 Tests live in `tests/` and mirror the major modules. Deployment assets are at the repo
 root: `Dockerfile`, `docker-compose.yml`, `.env.example`, and `scripts/entrypoint.py`.
-`DESIGN.md` contains product and architecture notes.
+`DESIGN.md` contains product and architecture notes. Native filesystem client planning
+lives in `macos/` and `windows/`; shared client/backend contracts live in `docs/`.
 
 ## Build, Test, and Development Commands
 
@@ -26,6 +27,8 @@ Target Python 3.12+. Use 4-space indentation, type hints for public functions, a
 `snake_case` for modules, functions, and variables. Use `PascalCase` for classes and
 `UPPER_SNAKE_CASE` for constants. Keep Immich API access behind `ImmichClient`; keep
 path resolution, auth, caching, locking, and write policy in separate modules.
+Native clients should consume a platform-neutral `/api/fs/v1` contract instead of
+duplicating Immich layout logic in Swift or Windows code.
 
 Ruff is the formatter and linter. Run `make lint` before publishing changes.
 

@@ -15,6 +15,9 @@ LABEL org.opencontainers.image.licenses="MIT"
 LABEL org.opencontainers.image.vendor="barryw"
 
 WORKDIR /app
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 RUN pip install uv
 
@@ -23,8 +26,8 @@ COPY src/ ./src/
 COPY scripts/ ./scripts/
 COPY --from=admin-ui /ui/dist ./src/immich_bridge/admin_static/
 
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev && uv cache clean
 
 EXPOSE 8080 8081
 
-CMD ["uv", "run", "python", "scripts/entrypoint.py"]
+CMD ["python", "-m", "immich_bridge.main"]
