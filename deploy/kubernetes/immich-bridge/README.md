@@ -33,5 +33,6 @@ Woodpecker publishes immutable images as:
 
 `ghcr.io/barryw/immich-bridge:sha-<commit>`
 
-On `main`, the `gitops-image-bump` step updates the infrastructure manifest to
-the new immutable tag. ArgoCD then reconciles `kubernetes-default/immich-bridge`.
+On `main`, the `gitops-image-bump` step copies this manifest into infrastructure
+and rewrites the image to the new immutable tag. ArgoCD then reconciles
+`kubernetes-default/immich-bridge`.

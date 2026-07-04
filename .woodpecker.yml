@@ -87,12 +87,15 @@ steps:
       - SHORT_SHA=$(printf "%.12s" "$CI_COMMIT_SHA")
       - IMAGE_TAG="sha-$SHORT_SHA"
       - BRANCH="ci/immich-bridge-$IMAGE_TAG"
+      - APP_MANIFEST="$PWD/deploy/kubernetes/immich-bridge/resources.yaml"
+      - test -f "$APP_MANIFEST"
       - git clone "https://x-access-token:$GITHUB_TOKEN@github.com/barryw/infrastructure.git" /tmp/infrastructure
       - cd /tmp/infrastructure
       - git config user.email "ci@woodpecker.local"
       - git config user.name "Woodpecker CI"
       - git checkout -b "$BRANCH"
-      - test -f kubernetes-default/immich-bridge/resources.yaml
+      - test -d kubernetes-default/immich-bridge
+      - cp "$APP_MANIFEST" kubernetes-default/immich-bridge/resources.yaml
       - sed -i "s#ghcr.io/barryw/immich-bridge:[^[:space:]]*#ghcr.io/barryw/immich-bridge:$IMAGE_TAG#g" kubernetes-default/immich-bridge/resources.yaml
       - git diff --quiet && { echo "GitOps manifest already references $IMAGE_TAG"; exit 0; }
       - git add kubernetes-default/immich-bridge/resources.yaml
