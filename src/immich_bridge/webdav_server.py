@@ -209,6 +209,17 @@ class ClientCompatibilityMiddleware:
                 token=token,
             )
 
+        if self._should_redirect_browser_root(environ, method=method, path=path):
+            return self._redirect_browser_root(
+                started_at=started_at,
+                method=method,
+                path=path,
+                client=client,
+                request_id=str(request_id),
+                start_response=start_response,
+                token=token,
+            )
+
         max_body_bytes = self._max_body_bytes_for_method(method)
         if max_body_bytes > 0 and "wsgi.input" in environ:
             environ["wsgi.input"] = LimitedInput(
@@ -384,6 +395,57 @@ class ClientCompatibilityMiddleware:
             return HTTPStatus.LENGTH_REQUIRED, "Content-Length required for write methods"
 
         return None
+
+    def _should_redirect_browser_root(
+        self,
+        environ: dict[str, Any],
+        *,
+        method: str,
+        path: str,
+    ) -> bool:
+        """Return true for unauthenticated browser visits to the bare DAV root."""
+        if method not in {"GET", "HEAD"} or path not in {"", "/"}:
+            return False
+        if environ.get("HTTP_AUTHORIZATION"):
+            return False
+        accept = str(environ.get("HTTP_ACCEPT") or "").lower()
+        return "text/html" in accept
+
+    def _redirect_browser_root(
+        self,
+        *,
+        started_at: float,
+        method: str,
+        path: str,
+        client: WebDAVClient,
+        request_id: str,
+        start_response: ABCCallable[..., Any],
+        token: Any,
+    ) -> Iterable[bytes]:
+        """Redirect human browser visits to the admin UI before Basic auth."""
+        headers = [
+            ("Location", "/admin"),
+            ("Content-Length", "0"),
+            ("Vary", "Accept"),
+        ]
+        self._apply_security_headers(headers)
+        self._append_header_if_missing(headers, "X-Request-Id", request_id)
+        start_response(
+            f"{HTTPStatus.SEE_OTHER.value} {HTTPStatus.SEE_OTHER.phrase}",
+            headers,
+        )
+        logger.info(
+            "webdav_browser_root_redirect",
+            request_id=request_id,
+            method=method,
+            path=path,
+            status=HTTPStatus.SEE_OTHER.value,
+            location="/admin",
+            client=client.value,
+            elapsed_ms=round((perf_counter() - started_at) * 1000, 2),
+        )
+        reset_request_id(token)
+        return []
 
     def _max_body_bytes_for_method(self, method: str) -> int:
         """Return the configured body cap for a request method."""

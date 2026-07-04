@@ -145,6 +145,115 @@ def test_client_middleware_rejects_oversized_request_bodies() -> None:
     app.assert_not_called()
 
 
+def test_client_middleware_redirects_unauthenticated_browser_root() -> None:
+    """Browser visits to / should reach the admin UI before Basic auth."""
+    app = MagicMock()
+    statuses: list[str] = []
+    headers: list[tuple[str, str]] = []
+
+    def start_response(
+        status: str,
+        response_headers: list[tuple[str, str]],
+        exc_info: object = None,
+    ) -> None:
+        statuses.append(status)
+        headers.extend(response_headers)
+
+    middleware = ClientCompatibilityMiddleware(app)  # type: ignore[arg-type]
+    body = list(
+        middleware(
+            {
+                "REQUEST_METHOD": "GET",
+                "PATH_INFO": "/",
+                "HTTP_ACCEPT": "text/html,application/xhtml+xml",
+                "HTTP_X_REQUEST_ID": "req-browser-root",
+            },
+            start_response,
+        )
+    )
+
+    assert statuses == ["303 See Other"]
+    assert body == []
+    assert ("Location", "/admin") in headers
+    assert ("Content-Length", "0") in headers
+    assert ("Vary", "Accept") in headers
+    assert ("X-Request-Id", "req-browser-root") in headers
+    assert not any(name.lower() == "www-authenticate" for name, _ in headers)
+    app.assert_not_called()
+
+
+def test_client_middleware_keeps_dav_root_requests_on_webdav() -> None:
+    """DAV methods should not be redirected away from the WebDAV root."""
+    app = MagicMock(return_value=[b"ok"])
+    statuses: list[str] = []
+
+    def start_response(
+        status: str,
+        response_headers: list[tuple[str, str]],
+        exc_info: object = None,
+    ) -> None:
+        statuses.append(status)
+
+    def dav_app(environ: dict[str, object], start_response: object) -> list[bytes]:
+        app(environ, start_response)
+        start_response("207 Multi-Status", [])  # type: ignore[operator]
+        return [b"ok"]
+
+    middleware = ClientCompatibilityMiddleware(dav_app)  # type: ignore[arg-type]
+    body = list(
+        middleware(
+            {
+                "REQUEST_METHOD": "PROPFIND",
+                "PATH_INFO": "/",
+                "HTTP_ACCEPT": "text/html,application/xhtml+xml",
+                "HTTP_X_REQUEST_ID": "req-dav-root",
+            },
+            start_response,
+        )
+    )
+
+    assert statuses == ["207 Multi-Status"]
+    assert body == [b"ok"]
+    app.assert_called_once()
+
+
+def test_client_middleware_keeps_authenticated_browser_root_on_webdav() -> None:
+    """Authenticated root requests should remain available to DAV clients."""
+    calls = 0
+    statuses: list[str] = []
+
+    def app(environ: dict[str, object], start_response: object) -> list[bytes]:
+        nonlocal calls
+        calls += 1
+        start_response("200 OK", [])  # type: ignore[operator]
+        return [b"ok"]
+
+    def start_response(
+        status: str,
+        response_headers: list[tuple[str, str]],
+        exc_info: object = None,
+    ) -> None:
+        statuses.append(status)
+
+    middleware = ClientCompatibilityMiddleware(app)  # type: ignore[arg-type]
+    body = list(
+        middleware(
+            {
+                "REQUEST_METHOD": "GET",
+                "PATH_INFO": "/",
+                "HTTP_ACCEPT": "text/html,application/xhtml+xml",
+                "HTTP_AUTHORIZATION": "Basic dXNlcjprZXk=",
+                "HTTP_X_REQUEST_ID": "req-auth-root",
+            },
+            start_response,
+        )
+    )
+
+    assert statuses == ["200 OK"]
+    assert body == [b"ok"]
+    assert calls == 1
+
+
 def test_client_middleware_uses_separate_upload_body_limit() -> None:
     """PUT uploads should use the upload cap, not the metadata request cap."""
     calls = 0
