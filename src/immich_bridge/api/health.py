@@ -67,7 +67,7 @@ async def readiness_check(
     all_ready = all(checks.values())
 
     if not all_ready:
-        response.status_code = 503
+        response.status_code = 500
         logger.warning("readiness_check_failed", checks=checks)
 
     return {

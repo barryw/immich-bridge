@@ -182,6 +182,73 @@ def test_client_middleware_redirects_unauthenticated_browser_root() -> None:
     app.assert_not_called()
 
 
+def test_client_middleware_health_bypasses_webdav_auth() -> None:
+    """Health endpoints should not invoke WsgiDAV Basic auth."""
+    app = MagicMock()
+    statuses: list[str] = []
+    headers: list[tuple[str, str]] = []
+
+    def start_response(
+        status: str,
+        response_headers: list[tuple[str, str]],
+        exc_info: object = None,
+    ) -> None:
+        statuses.append(status)
+        headers.extend(response_headers)
+
+    middleware = ClientCompatibilityMiddleware(app)  # type: ignore[arg-type]
+    body = list(
+        middleware(
+            {
+                "REQUEST_METHOD": "GET",
+                "PATH_INFO": "/health",
+                "HTTP_X_REQUEST_ID": "req-health",
+            },
+            start_response,
+        )
+    )
+
+    assert statuses == ["200 OK"]
+    assert body == [b'{"status":"healthy"}\n']
+    assert ("Content-Type", "application/json") in headers
+    assert ("Cache-Control", "no-store") in headers
+    assert ("X-Request-Id", "req-health") in headers
+    assert not any(name.lower() == "www-authenticate" for name, _ in headers)
+    app.assert_not_called()
+
+
+def test_client_middleware_health_head_has_no_body() -> None:
+    """HEAD health probes should return headers without a body."""
+    app = MagicMock()
+    statuses: list[str] = []
+    headers: list[tuple[str, str]] = []
+
+    def start_response(
+        status: str,
+        response_headers: list[tuple[str, str]],
+        exc_info: object = None,
+    ) -> None:
+        statuses.append(status)
+        headers.extend(response_headers)
+
+    middleware = ClientCompatibilityMiddleware(app)  # type: ignore[arg-type]
+    body = list(
+        middleware(
+            {
+                "REQUEST_METHOD": "HEAD",
+                "PATH_INFO": "/ready",
+                "HTTP_X_REQUEST_ID": "req-ready-head",
+            },
+            start_response,
+        )
+    )
+
+    assert statuses == ["200 OK"]
+    assert body == []
+    assert ("Content-Length", "0") in headers
+    app.assert_not_called()
+
+
 def test_client_middleware_keeps_dav_root_requests_on_webdav() -> None:
     """DAV methods should not be redirected away from the WebDAV root."""
     app = MagicMock(return_value=[b"ok"])

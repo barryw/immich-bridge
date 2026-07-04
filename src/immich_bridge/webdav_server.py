@@ -22,6 +22,10 @@ SECURITY_HEADERS = (
     ("X-Frame-Options", "DENY"),
     ("Referrer-Policy", "no-referrer"),
 )
+HEALTH_PATHS = {
+    "/health": b'{"status":"healthy"}\n',
+    "/ready": b'{"status":"ready"}\n',
+}
 
 
 class RequestBodyTooLarge(Exception):
@@ -200,6 +204,17 @@ class ClientCompatibilityMiddleware:
             return self._reject_request(
                 status,
                 reason,
+                started_at=started_at,
+                method=method,
+                path=path,
+                client=client,
+                request_id=str(request_id),
+                start_response=start_response,
+                token=token,
+            )
+
+        if self._is_health_request(method=method, path=path):
+            return self._health_response(
                 started_at=started_at,
                 method=method,
                 path=path,
@@ -395,6 +410,43 @@ class ClientCompatibilityMiddleware:
             return HTTPStatus.LENGTH_REQUIRED, "Content-Length required for write methods"
 
         return None
+
+    def _is_health_request(self, *, method: str, path: str) -> bool:
+        """Return true when a health probe should bypass WebDAV auth."""
+        return method in {"GET", "HEAD"} and path in HEALTH_PATHS
+
+    def _health_response(
+        self,
+        *,
+        started_at: float,
+        method: str,
+        path: str,
+        client: WebDAVClient,
+        request_id: str,
+        start_response: ABCCallable[..., Any],
+        token: Any,
+    ) -> Iterable[bytes]:
+        """Return an unauthenticated health response before WsgiDAV auth."""
+        body = HEALTH_PATHS[path]
+        headers = [
+            ("Content-Type", "application/json"),
+            ("Content-Length", "0" if method == "HEAD" else str(len(body))),
+            ("Cache-Control", "no-store"),
+        ]
+        self._apply_security_headers(headers)
+        self._append_header_if_missing(headers, "X-Request-Id", request_id)
+        start_response(f"{HTTPStatus.OK.value} {HTTPStatus.OK.phrase}", headers)
+        logger.info(
+            "webdav_health_response",
+            request_id=request_id,
+            method=method,
+            path=path,
+            status=HTTPStatus.OK.value,
+            client=client.value,
+            elapsed_ms=round((perf_counter() - started_at) * 1000, 2),
+        )
+        reset_request_id(token)
+        return [] if method == "HEAD" else [body]
 
     def _should_redirect_browser_root(
         self,
