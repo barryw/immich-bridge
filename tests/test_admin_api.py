@@ -370,6 +370,73 @@ def test_share_link_login_creates_share_guest_mount(tmp_path: Path) -> None:
     ).json() == {"libraries": []}
 
 
+def test_viewer_session_can_add_multiple_share_mounts(tmp_path: Path) -> None:
+    """Viewer sessions should be able to attach multiple share links as mounts."""
+    client = make_client(tmp_path)
+    with patch(
+        "immich_bridge.api.auth.validate_immich_share_link",
+        side_effect=[
+            ShareIdentity(
+                share_id="share-1",
+                name="Summer Trip",
+                description=None,
+                allow_download=True,
+                allow_upload=False,
+                expires_at=None,
+                asset_count=23,
+                album_id="album-1",
+            ),
+            ShareIdentity(
+                share_id="share-2",
+                name="Winter Trip",
+                description=None,
+                allow_download=True,
+                allow_upload=True,
+                expires_at=None,
+                asset_count=12,
+                album_id="album-2",
+            ),
+        ],
+    ) as validate_share:
+        first = client.post(
+            "/api/auth/share-link",
+            json={"share_url": "http://immich.test/share/share-one"},
+        )
+        token = first.json()["session_token"]
+        second = client.post(
+            "/api/auth/session/share-link",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"share_url": "http://immich.test/share/share-two"},
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["session_token"] is None
+    assert second.json()["principal"]["kind"] == "share_guest"
+    assert [grant["share_name"] for grant in second.json()["grants"]] == [
+        "Summer Trip",
+        "Winter Trip",
+    ]
+    assert validate_share.call_count == 2
+
+    mounts = client.get("/api/me/mounts", headers={"Authorization": f"Bearer {token}"})
+    assert mounts.status_code == 200
+    assert [mount["id"] for mount in mounts.json()["mounts"]] == [
+        "share:default:share-1",
+        "share:default:share-2",
+    ]
+    assert [mount["display_name"] for mount in mounts.json()["mounts"]] == [
+        "Summer Trip",
+        "Winter Trip",
+    ]
+    assert mounts.json()["mounts"][1]["capabilities"] == [
+        "browse",
+        "thumbnail",
+        "download",
+        "upload",
+    ]
+
+
 def test_share_link_login_accepts_public_url_for_internal_library_url(tmp_path: Path) -> None:
     """Public share-link URLs should map to the library's internal API URL."""
     client = make_client(tmp_path)

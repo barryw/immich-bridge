@@ -25,12 +25,12 @@ struct Principal: Codable, Equatable {
         switch kind {
         case "superadmin":
             "Superadmin"
-        case "immich_admin":
+        case "immich_admin", "library_admin":
             "Library admin"
         case "share_guest":
             "Viewer"
         default:
-            kind
+            "Viewer"
         }
     }
 }
@@ -120,6 +120,9 @@ struct AdminSession: Codable, Equatable {
         if principal?.kind == "superadmin" || principal?.kind == "immich_admin" {
             return true
         }
+        if principal?.kind == "library_admin" {
+            return true
+        }
         if principal == nil, user != nil, grants.isEmpty {
             return true
         }
@@ -129,6 +132,13 @@ struct AdminSession: Codable, Equatable {
                 || grant.hasCapability("manage_policy")
                 || grant.hasCapability("manage_views")
         }
+    }
+
+    var roleLabel: String {
+        if let principal {
+            return principal.roleLabel
+        }
+        return isAdminCapable ? "Library admin" : "Viewer"
     }
 }
 
@@ -306,12 +316,12 @@ struct BridgeProfile: Codable, Identifiable, Equatable {
         switch principalKind {
         case "superadmin":
             "Superadmin"
-        case "immich_admin":
+        case "immich_admin", "library_admin":
             "Library admin"
         case "share_guest":
             "Viewer"
         default:
-            authKind.label
+            authKind == .admin ? "Library admin" : "Viewer"
         }
     }
 }

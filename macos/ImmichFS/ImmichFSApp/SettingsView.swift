@@ -98,6 +98,14 @@ final class AppState: ObservableObject {
         session?.displayName ?? activeProfile?.principalName ?? activeProfile?.displayName ?? username
     }
 
+    var roleLabel: String {
+        session?.roleLabel ?? activeProfile?.roleLabel ?? "Viewer"
+    }
+
+    var isViewer: Bool {
+        isAuthenticated && !canManageBridge
+    }
+
     var statusText: String {
         if isAuthenticated {
             let host = activeProfile?.hostLabel ?? URL(string: bridgeURLText)?.host ?? "Immich Bridge"
@@ -139,6 +147,16 @@ final class AppState: ObservableObject {
         apiKeyInput = ""
         shareURLInput = ""
         connectionMode = .admin
+    }
+
+    func beginAddShare() {
+        isAddingBridge = true
+        errorMessage = nil
+        bridgeURLText = activeProfile?.bridgeURL ?? bridgeURLText
+        username = ""
+        apiKeyInput = ""
+        shareURLInput = ""
+        connectionMode = .share
     }
 
     func cancelAddBridge() {
@@ -195,13 +213,30 @@ final class AppState: ObservableObject {
 
         do {
             let bridgeURL = try normalizedBridgeURL(from: bridgeURLText)
+            let shareURL = shareURLInput
+            if isViewer,
+               let activeProfile,
+               activeProfile.authKind == .share,
+               activeProfile.bridgeURL == bridgeURL.absoluteString,
+               let api {
+                let currentSession = try await api.addShareLink(shareURL: shareURL)
+                let mounts = try await loadMounts(for: currentSession, using: api)
+                session = currentSession
+                availableMounts = mounts
+                updateActiveProfile(session: currentSession, mounts: mounts)
+                try appendShareURL(shareURL, for: activeProfile.id)
+                isAddingBridge = false
+                shareURLInput = ""
+                lastRefresh = Date()
+                return
+            }
+
             let client = AdminAPI(baseURL: bridgeURL)
             let currentSession = try await client.shareLogin(shareURL: shareURLInput)
             guard let token = currentSession.sessionToken else {
                 throw AdminAPIError.emptyResponse
             }
 
-            let shareURL = shareURLInput
             try await finishConnection(
                 client: client,
                 currentSession: currentSession,
@@ -453,7 +488,8 @@ final class AppState: ObservableObject {
         do {
             let bridgeURL = try normalizedBridgeURL(from: profile.bridgeURL)
             let client = AdminAPI(baseURL: bridgeURL)
-            let currentSession: AdminSession
+            var currentSession: AdminSession
+            let sessionToken: String
             let secret: String
             switch profile.authKind {
             case .admin:
@@ -464,18 +500,26 @@ final class AppState: ObservableObject {
                     return false
                 }
                 currentSession = try await client.login(username: profile.username ?? username, apiKey: apiKey)
+                guard let token = currentSession.sessionToken else {
+                    throw AdminAPIError.emptyResponse
+                }
+                sessionToken = token
                 secret = apiKey
                 storedApiKey = apiKey
             case .share:
-                guard let shareURL = try KeychainStore.read(accountName: shareURLAccount(for: profile.id)),
-                      !shareURL.isEmpty else {
+                let shareURLs = try readShareURLs(for: profile.id)
+                guard let firstShareURL = shareURLs.first else {
                     return false
                 }
-                currentSession = try await client.shareLogin(shareURL: shareURL)
-                secret = shareURL
-            }
-            guard let token = currentSession.sessionToken else {
-                throw AdminAPIError.emptyResponse
+                currentSession = try await client.shareLogin(shareURL: firstShareURL)
+                guard let token = currentSession.sessionToken else {
+                    throw AdminAPIError.emptyResponse
+                }
+                sessionToken = token
+                for shareURL in shareURLs.dropFirst() {
+                    currentSession = try await client.addShareLink(shareURL: shareURL)
+                }
+                secret = firstShareURL
             }
             try await finishConnection(
                 client: client,
@@ -483,10 +527,13 @@ final class AppState: ObservableObject {
                 bridgeURL: bridgeURL,
                 authKind: profile.authKind,
                 username: profile.username,
-                sessionToken: token,
+                sessionToken: sessionToken,
                 secret: secret,
                 refreshAdminState: false
             )
+            if profile.authKind == .share {
+                try saveShareURLs(readShareURLs(for: profile.id), for: profile.id)
+            }
             return true
         } catch {
             return false
@@ -612,7 +659,7 @@ final class AppState: ObservableObject {
         case .admin:
             try KeychainStore.save(secret, accountName: adminApiKeyAccount(for: profile.id))
         case .share:
-            try KeychainStore.save(secret, accountName: shareURLAccount(for: profile.id))
+            try appendShareURL(secret, for: profile.id)
         }
         isAddingBridge = false
         lastRefresh = Date()
@@ -752,6 +799,53 @@ final class AppState: ObservableObject {
     private func shareURLAccount(for profileID: UUID) -> String {
         "profile.\(profileID.uuidString).share-url"
     }
+
+    private func readShareURLs(for profileID: UUID) throws -> [String] {
+        guard let stored = try KeychainStore.read(accountName: shareURLAccount(for: profileID)) else {
+            return []
+        }
+        if let data = stored.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode([String].self, from: data) {
+            return uniqueShareURLs(decoded)
+        }
+        return uniqueShareURLs([stored])
+    }
+
+    private func appendShareURL(_ shareURL: String, for profileID: UUID) throws {
+        var shareURLs = try readShareURLs(for: profileID)
+        let trimmed = shareURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty && !shareURLs.contains(trimmed) {
+            shareURLs.append(trimmed)
+        }
+        try saveShareURLs(shareURLs, for: profileID)
+    }
+
+    private func saveShareURLs(_ shareURLs: [String], for profileID: UUID) throws {
+        let cleaned = uniqueShareURLs(shareURLs)
+        guard !cleaned.isEmpty else {
+            try KeychainStore.delete(accountName: shareURLAccount(for: profileID))
+            return
+        }
+        let data = try JSONEncoder().encode(cleaned)
+        guard let encoded = String(data: data, encoding: .utf8) else {
+            return
+        }
+        try KeychainStore.save(encoded, accountName: shareURLAccount(for: profileID))
+    }
+
+    private func uniqueShareURLs(_ shareURLs: [String]) -> [String] {
+        var seen = Set<String>()
+        var values: [String] = []
+        for shareURL in shareURLs {
+            let trimmed = shareURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !seen.contains(trimmed) else {
+                continue
+            }
+            seen.insert(trimmed)
+            values.append(trimmed)
+        }
+        return values
+    }
 }
 
 enum AdminSection: String, CaseIterable, Identifiable, Hashable {
@@ -880,7 +974,7 @@ private struct ViewerSettingsView: View {
                     GroupBox("Access") {
                         Grid(alignment: .leading, horizontalSpacing: 28, verticalSpacing: 10) {
                             InfoRow("Bridge", state.activeProfile?.hostLabel ?? state.bridgeURLText)
-                            InfoRow("Role", state.session?.principal?.roleLabel ?? "Viewer")
+                            InfoRow("Role", state.roleLabel)
                             InfoRow("User", state.displayUser)
                             InfoRow("Expires", state.session?.expiresAt ?? "-")
                         }
@@ -961,6 +1055,7 @@ private struct HeaderView: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
+            RoleBadge(role: state.roleLabel)
 
             Spacer()
 
@@ -987,6 +1082,20 @@ private struct HeaderView: View {
             }
         }
         .padding(18)
+    }
+}
+
+struct RoleBadge: View {
+    var role: String
+
+    var body: some View {
+        Text(role)
+            .font(.caption.weight(.semibold))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(.tint.opacity(0.12), in: Capsule())
+            .foregroundStyle(.tint)
+            .accessibilityLabel("Signed in as \(role)")
     }
 }
 

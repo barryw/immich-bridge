@@ -78,6 +78,7 @@ export function App() {
     <ShellFrame
       status="online"
       userLabel={session.data.user?.email ?? session.data.user?.name ?? "Immich admin"}
+      roleLabel={roleLabelFor(session.data)}
       active={section}
       onNavigate={setSection}
       onLogout={() => {
@@ -93,6 +94,7 @@ function ShellFrame({
   children,
   status,
   userLabel,
+  roleLabel,
   active = "overview",
   onNavigate,
   onLogout
@@ -100,6 +102,7 @@ function ShellFrame({
   children?: React.ReactNode;
   status: "checking" | "locked" | "online";
   userLabel?: string;
+  roleLabel?: string;
   active?: Section;
   onNavigate?: (section: Section) => void;
   onLogout?: () => void;
@@ -134,7 +137,12 @@ function ShellFrame({
         </nav>
 
         <div className="rail-footer">
-          {userLabel && <span className="user-label">{userLabel}</span>}
+          {userLabel && (
+            <div className="user-context">
+              <span className="role-pill">{roleLabel ?? "Library admin"}</span>
+              <span className="user-label">{userLabel}</span>
+            </div>
+          )}
           {onLogout && (
             <button className="icon-button" onClick={onLogout} title="Sign out">
               <LogOut size={18} />
@@ -146,6 +154,20 @@ function ShellFrame({
       <main className="workbench">{children ?? <div className="loading-strip">Loading</div>}</main>
     </div>
   );
+}
+
+function roleLabelFor(session: { principal?: { kind: string } | null }): string {
+  switch (session.principal?.kind) {
+    case "superadmin":
+      return "Superadmin";
+    case "immich_admin":
+    case "library_admin":
+      return "Library admin";
+    case "share_guest":
+      return "Viewer";
+    default:
+      return "Library admin";
+  }
 }
 
 function LoginPanel({ onLogin }: { onLogin: () => void }) {

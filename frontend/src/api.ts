@@ -5,9 +5,16 @@ export type AdminUser = {
   api_key_name?: string | null;
 };
 
+export type Principal = {
+  id: string;
+  kind: string;
+  display_name?: string | null;
+};
+
 export type AdminSession = {
   authenticated: boolean;
   user?: AdminUser | null;
+  principal?: Principal | null;
   expires_at?: string | null;
   session_token?: string | null;
 };

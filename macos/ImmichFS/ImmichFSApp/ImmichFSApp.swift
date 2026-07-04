@@ -41,15 +41,16 @@ private struct ConnectPopover: View {
     @ObservedObject var state: AppState
 
     var body: some View {
+        let isAddingShare = state.isAddingBridge && state.isViewer && state.connectionMode == .share
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 10) {
                 Image(systemName: "externaldrive.badge.plus")
                     .font(.title2)
                     .foregroundStyle(.tint)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(state.isAddingBridge ? "Add Bridge" : "Connect Immich Bridge")
+                    Text(isAddingShare ? "Add Share" : (state.isAddingBridge ? "Add Bridge" : "Connect Immich Bridge"))
                         .font(.headline)
-                    Text("Use admin credentials or an Immich share link.")
+                    Text(isAddingShare ? "Paste another Immich share link." : "Use admin credentials or an Immich share link.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -101,7 +102,10 @@ private struct ConnectPopover: View {
                         await state.connect()
                     }
                 } label: {
-                    Label(state.isLoading ? "Connecting" : "Connect", systemImage: "bolt.horizontal")
+                    Label(
+                        state.isLoading ? "Connecting" : (isAddingShare ? "Add Share" : "Connect"),
+                        systemImage: "bolt.horizontal"
+                    )
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(state.isLoading || !state.canConnect)
@@ -143,10 +147,13 @@ private struct ConnectedPopover: View {
                     Text(state.activeProfile?.displayName ?? "Immich Bridge")
                         .font(.headline)
                         .lineLimit(1)
-                    Text(state.statusText)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
+                    HStack(spacing: 6) {
+                        RoleBadge(role: state.roleLabel)
+                        Text(state.statusText)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
                 }
                 Spacer()
             }
@@ -210,10 +217,23 @@ private struct ConnectedPopover: View {
                 }
 
                 Button {
-                    state.beginAddBridge()
+                    if state.isViewer {
+                        state.beginAddShare()
+                    } else {
+                        state.beginAddBridge()
+                    }
                 } label: {
-                    Label("Add Bridge", systemImage: "plus")
+                    Label(state.isViewer ? "Add Share" : "Add Bridge", systemImage: "plus")
                 }
+
+                Button {
+                    Task {
+                        await state.signOut()
+                    }
+                } label: {
+                    Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
+                }
+                .disabled(state.isLoading)
 
                 Spacer()
 

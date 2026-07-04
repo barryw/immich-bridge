@@ -585,6 +585,23 @@ class AdminStore:
                 ),
             )
 
+    def update_session_grants(self, token_hash: str, grants: list[dict[str, Any]]) -> None:
+        """Replace a live session's grants."""
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE admin_sessions
+                SET grants_json = ?, last_seen_at = ?
+                WHERE token_hash = ? AND expires_at > ?
+                """,
+                (
+                    json.dumps(grants, sort_keys=True),
+                    utc_now(),
+                    token_hash,
+                    utc_now(),
+                ),
+            )
+
     def get_session(self, token_hash: str) -> dict[str, Any] | None:
         """Return a live admin session."""
         now = utc_now()

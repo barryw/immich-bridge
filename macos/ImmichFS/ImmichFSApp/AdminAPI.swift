@@ -65,6 +65,14 @@ final class AdminAPI {
         return response
     }
 
+    func addShareLink(shareURL: String) async throws -> AdminSession {
+        try await send(
+            "/api/auth/session/share-link",
+            method: "POST",
+            body: ShareLoginRequest(shareUrl: shareURL)
+        )
+    }
+
     func sessionStatus() async throws -> AdminSession {
         try await send("/api/admin/session")
     }
