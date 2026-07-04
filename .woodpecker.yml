@@ -56,21 +56,20 @@ steps:
     depends_on: [test, frontend-build]
 
   image-publish:
-    image: gcr.io/kaniko-project/executor:debug
+    image: woodpeckerci/plugin-kaniko@sha256:b88802ba66af95ee28a8ffde08715631ec2892e024b2c74e90e19f73a5c2c602
     when:
       - event: push
         branch: main
-    environment:
-      GHCR_TOKEN:
+    settings:
+      repo: barryw/immich-bridge
+      dockerfile: Dockerfile
+      registry: ghcr.io
+      username: barryw
+      password:
         from_secret: ghcr_token
-    commands:
-      - SHORT_SHA=$(printf "%.12s" "$CI_COMMIT_SHA")
-      - IMAGE_TAG="sha-$SHORT_SHA"
-      - mkdir -p /kaniko/.docker
-      - printf '{"auths":{"ghcr.io":{"username":"barryw","password":"%s"}}}\n' "$GHCR_TOKEN" > /kaniko/.docker/config.json
-      - BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-      - echo "Publishing ghcr.io/barryw/immich-bridge:$IMAGE_TAG"
-      - /kaniko/executor --dockerfile=Dockerfile --context=. --destination=ghcr.io/barryw/immich-bridge:$IMAGE_TAG --destination=ghcr.io/barryw/immich-bridge:latest --label "org.opencontainers.image.created=$BUILD_DATE" --label "org.opencontainers.image.revision=$CI_COMMIT_SHA" --label "org.opencontainers.image.source=https://github.com/barryw/immich-bridge"
+      tags:
+        - "sha-${CI_COMMIT_SHA:0:12}"
+        - latest
     depends_on: [test, frontend-build]
 
   gitops-image-bump:
