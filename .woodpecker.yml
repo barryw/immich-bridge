@@ -73,24 +73,31 @@ steps:
     depends_on: [test, frontend-build]
 
   gitops-image-bump:
-    image: alpine/git:2.47.2
+    image: alpine:3.21
     when:
       - event: push
         branch: main
     environment:
+      GH_TOKEN:
+        from_secret: github_token
       GITHUB_TOKEN:
         from_secret: github_token
     commands:
+      - apk add --no-cache git github-cli
       - SHORT_SHA=$(printf "%.12s" "$CI_COMMIT_SHA")
       - IMAGE_TAG="sha-$SHORT_SHA"
+      - BRANCH="ci/immich-bridge-$IMAGE_TAG"
       - git clone "https://x-access-token:$GITHUB_TOKEN@github.com/barryw/infrastructure.git" /tmp/infrastructure
       - cd /tmp/infrastructure
       - git config user.email "ci@woodpecker.local"
       - git config user.name "Woodpecker CI"
+      - git checkout -b "$BRANCH"
       - test -f kubernetes-default/immich-bridge/resources.yaml
       - sed -i "s#ghcr.io/barryw/immich-bridge:[^[:space:]]*#ghcr.io/barryw/immich-bridge:$IMAGE_TAG#g" kubernetes-default/immich-bridge/resources.yaml
       - git diff --quiet && { echo "GitOps manifest already references $IMAGE_TAG"; exit 0; }
       - git add kubernetes-default/immich-bridge/resources.yaml
       - 'git commit -m "deploy: immich-bridge $IMAGE_TAG"'
-      - git push origin main
+      - git push --force-with-lease origin "$BRANCH"
+      - 'PR_URL=$(gh pr create --repo barryw/infrastructure --base main --head "$BRANCH" --title "deploy: immich-bridge $IMAGE_TAG" --body "Updates immich-bridge to ghcr.io/barryw/immich-bridge:$IMAGE_TAG.")'
+      - gh pr merge "$PR_URL" --repo barryw/infrastructure --squash --delete-branch --admin
     depends_on: [image-publish]
