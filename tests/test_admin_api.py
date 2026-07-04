@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from immich_bridge.admin_store import get_admin_store
+from immich_bridge.api import admin as admin_api
 from immich_bridge.api.admin import SESSION_COOKIE, _token_hash
 from immich_bridge.app import create_app
 from immich_bridge.authz import verify_grants_token
@@ -800,3 +801,25 @@ def test_admin_match_count_fallback_ignores_deprecated_metadata_total(tmp_path: 
     assert instance.search_assets.call_count == 2
     assert instance.search_assets.call_args_list[0].kwargs["size"] == 500
     assert instance.search_assets.call_args_list[0].kwargs["with_exif"] is False
+
+
+def test_admin_context_recovers_api_key_from_shared_cache(tmp_path: Path) -> None:
+    """A valid session should survive a process-local admin API key cache miss."""
+    client = make_client(tmp_path)
+    token = login(client)
+
+    with admin_api._admin_api_keys_lock:
+        admin_api._admin_api_keys.pop(_token_hash(token), None)
+
+    with patch("immich_bridge.api.admin.ImmichClient") as fake_client:
+        instance = fake_client.return_value
+        instance.list_tags.return_value = []
+
+        response = client.get(
+            "/api/admin/options/tags",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert response.status_code == 200
+    fake_client.assert_called_once()
+    assert fake_client.call_args.kwargs["api_key"] == "key"

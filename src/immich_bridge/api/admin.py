@@ -25,6 +25,7 @@ from immich_bridge.authz import (
     sign_grants,
     superadmin_grant,
 )
+from immich_bridge.cache import get_cache
 from immich_bridge.config import Settings, get_settings
 from immich_bridge.fs_model import safe_segment
 from immich_bridge.immich_auth import ImmichIdentity, validate_immich_api_key
@@ -34,6 +35,7 @@ from immich_bridge.logging import get_logger
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 SESSION_COOKIE = "immich_bridge_admin"
+ADMIN_API_KEY_CACHE_PREFIX = "admin:api-key:"
 _admin_api_keys: dict[str, tuple[str, datetime]] = {}
 _admin_api_keys_lock = Lock()
 
@@ -281,26 +283,40 @@ def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def _admin_api_key_cache_key(token_hash: str) -> str:
+    return f"{ADMIN_API_KEY_CACHE_PREFIX}{token_hash}"
+
+
+def _session_ttl_seconds(expires_at: datetime) -> int:
+    return max(0, int((expires_at - datetime.now(UTC)).total_seconds()))
+
+
 def _remember_admin_api_key(token_hash: str, api_key: str, expires_at: datetime) -> None:
     with _admin_api_keys_lock:
         _admin_api_keys[token_hash] = (api_key, expires_at)
+    ttl = _session_ttl_seconds(expires_at)
+    if ttl > 0:
+        get_cache().set_json(_admin_api_key_cache_key(token_hash), {"api_key": api_key}, ttl=ttl)
 
 
 def _forget_admin_api_key(token_hash: str) -> None:
     with _admin_api_keys_lock:
         _admin_api_keys.pop(token_hash, None)
+    get_cache().delete_prefix(_admin_api_key_cache_key(token_hash))
 
 
 def _get_admin_api_key(token_hash: str) -> str | None:
     with _admin_api_keys_lock:
         entry = _admin_api_keys.get(token_hash)
-        if entry is None:
-            return None
-        api_key, expires_at = entry
-        if expires_at <= datetime.now(UTC):
-            _admin_api_keys.pop(token_hash, None)
-            return None
-        return api_key
+        if entry is not None:
+            api_key, expires_at = entry
+            if expires_at <= datetime.now(UTC):
+                _admin_api_keys.pop(token_hash, None)
+                return None
+            return api_key
+    cached = get_cache().get_json(_admin_api_key_cache_key(token_hash))
+    cached_api_key = cached.get("api_key") if cached else None
+    return cached_api_key if isinstance(cached_api_key, str) and cached_api_key else None
 
 
 def _identity_to_user(identity: ImmichIdentity) -> AdminUser:
