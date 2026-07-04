@@ -199,7 +199,9 @@ async def delete_current_session(
     response.delete_cookie(SESSION_COOKIE, path="/")
 
 
-def get_share_key_for_session(token_hash: str, share_key_hash_value: str | None = None) -> str | None:
+def get_share_key_for_session(
+    token_hash: str, share_key_hash_value: str | None = None
+) -> str | None:
     """Return a live raw share key for a session token hash, when cached."""
     with _share_keys_lock:
         entries = _share_keys.get(token_hash)
