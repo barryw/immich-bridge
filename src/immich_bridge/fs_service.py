@@ -20,8 +20,21 @@ from immich_bridge.fs_model import (
 )
 from immich_bridge.immich_client import ImmichApiError, ImmichClient
 from immich_bridge.logging import get_logger
+from collections.abc import Iterable
+from datetime import date as _Date
 
 logger = get_logger(__name__)
+
+
+def _day_names_in_range(days: Iterable[_Date], start: _Date, end: _Date) -> list[str]:
+    """Return unique day folders belonging to the parent date range."""
+    return [
+        day.isoformat()
+        for day in sorted(
+            {day for day in days if start <= day < end},
+            reverse=True,
+        )
+    ]
 
 
 class ImmichFilesystem:
@@ -299,8 +312,11 @@ class ImmichFilesystem:
                 taken_before=iso_boundary(date_range.end),
                 with_exif=False,
             )
-            days = sorted({asset_datetime(asset).date() for asset in assets}, reverse=True)
-            return [day.isoformat() for day in days]
+            return _day_names_in_range(
+                (asset_datetime(asset).date() for asset in assets),
+                date_range.start,
+                date_range.end,
+            )
 
         return []
 
@@ -403,8 +419,11 @@ class ImmichFilesystem:
                 order="desc",
                 with_exif=False,
             )
-            days = sorted({asset_datetime(asset).date() for asset in assets}, reverse=True)
-            return [day.isoformat() for day in days]
+            return _day_names_in_range(
+                (asset_datetime(asset).date() for asset in assets),
+                date_range.start,
+                date_range.end,
+            )
 
         return []
 
@@ -552,8 +571,11 @@ class ImmichFilesystem:
                 taken_before=iso_boundary(date_range.end),
                 with_exif=False,
             )
-            days = sorted({asset_datetime(asset).date() for asset in assets}, reverse=True)
-            return [day.isoformat() for day in days]
+            return _day_names_in_range(
+                (asset_datetime(asset).date() for asset in assets),
+                date_range.start,
+                date_range.end,
+            )
 
         return []
 
